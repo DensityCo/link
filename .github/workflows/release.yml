@@ -3,12 +3,22 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to release, for example v0.1.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
+    name: Build ${{ matrix.target }}
     strategy:
       matrix:
         include:
@@ -21,20 +31,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
       - uses: mlugg/setup-zig@v1
-      - run: cargo install cargo-zigbuild
-      - run: cargo zigbuild --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/link ${{ matrix.artifact }}
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build release binary
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/link dist/${{ matrix.artifact }}/link
+          cp README.md LICENSE dist/${{ matrix.artifact }}/
+          chmod +x dist/${{ matrix.artifact }}/link
+          tar -C dist -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
 
   release:
     needs: build
@@ -44,8 +74,9 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - run: chmod +x artifacts/*
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: artifacts/*
           generate_release_notes: true
