@@ -43,6 +43,8 @@ jobs:
           key: ${{ matrix.target }}
 
       - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
 
       - name: Install cargo-zigbuild
         run: cargo install cargo-zigbuild
