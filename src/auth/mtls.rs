@@ -39,11 +39,7 @@ pub fn build_tls_config(
         })?;
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)?;
-
-    Ok(Arc::new(config))
+    crate::tls::mtls_client_config(root_store, certs, key).map_err(MtlsError::Tls)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, MtlsError> {

@@ -46,6 +46,9 @@ pub async fn connect(config: &Config, serial: &str) -> Result<WsStream, Transpor
             let auth_headers = auth
                 .auth_headers(serial)
                 .map_err(|e| TransportError::Auth(e.to_string()))?;
+            let tls_config = crate::tls::webpki_client_config()
+                .map_err(|e| TransportError::Connection(e.to_string()))?;
+            let connector = tokio_tungstenite::Connector::Rustls(tls_config);
 
             use tungstenite::client::IntoClientRequest;
             let mut request = url
@@ -61,9 +64,14 @@ pub async fn connect(config: &Config, serial: &str) -> Result<WsStream, Transpor
                 );
             }
 
-            let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-                .await
-                .map_err(|e| TransportError::Connection(e.to_string()))?;
+            let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(connector),
+            )
+            .await
+            .map_err(|e| TransportError::Connection(e.to_string()))?;
 
             Ok(ws_stream)
         }

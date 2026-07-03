@@ -13,7 +13,8 @@ pub async fn download_firmware<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
-    let client = reqwest::Client::new();
+    let client =
+        crate::tls::reqwest_client().map_err(|e| DeploymentError::Download(e.to_string()))?;
     let response = client
         .get(&deployment.firmware_url)
         .send()

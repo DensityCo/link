@@ -8,6 +8,7 @@ pub mod device;
 pub mod extensions;
 pub mod protocol;
 pub mod runner;
+mod tls;
 pub mod transport;
 
 pub use client::{ClientEvent, LinkClient};
