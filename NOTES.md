@@ -26,7 +26,7 @@ src/
     health.rs      - Health extension report trait and system reporter
   runner.rs        - Reconnect loop with exponential backoff
   transport.rs     - WebSocket/TLS connection setup
-  client_update.rs - Client-side update protocol/status handling
+  client_deployment.rs - Client-side deployment workflow/status handling
   auth/
     mod.rs         - Auth module
     mtls.rs        - mTLS TLS config builder (cert/key/CA loading)
@@ -36,13 +36,13 @@ src/
     channel.rs     - Phoenix Channels wire message framing
     events.rs      - Typed protocol event names
     status.rs      - NervesHub status/progress payload builders
-  update/
+  deployment/
     mod.rs
-    types.rs       - Firmware update payload types
+    types.rs       - Deployment request payload types
     download.rs    - Firmware download and progress calculation
     fwup.rs        - fwup command execution
     installer.rs   - FirmwareInstaller trait and FwupInstaller
-    runner.rs      - Download/apply orchestration with typed progress events
+    runner.rs      - Deployment orchestration with typed progress events
   client.rs        - Link client facade and channel event loop
 ```
 
@@ -69,7 +69,7 @@ src/
 - shared_secret: algorithm string, header generation, determinism, differentiation
 - mtls: file loading error cases (missing, empty)
 - extensions/health: extension selection parsing, basic system metrics
-- update: update message parsing, progress calculation, safe firmware paths
+- deployment: deployment message parsing, progress calculation, safe firmware paths
 - client: creation, join payload with metadata, runtime device info
 - runner: backoff delay behavior
 

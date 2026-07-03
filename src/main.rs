@@ -18,11 +18,11 @@ async fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 ClientEvent::ConsoleStarted => info!("console session started"),
                 ClientEvent::ConsoleStopped => info!("console session stopped"),
                 ClientEvent::HealthReported => info!("health report sent"),
-                ClientEvent::UpdateAvailable(info) => {
+                ClientEvent::DeploymentAvailable(deployment) => {
                     info!(
-                        uuid = %info.firmware_meta.uuid,
-                        version = %info.firmware_meta.version,
-                        "firmware update available"
+                        uuid = %deployment.firmware_meta.uuid,
+                        version = %deployment.firmware_meta.version,
+                        "deployment available"
                     );
                 }
                 ClientEvent::FirmwareDownloaded(path) => {

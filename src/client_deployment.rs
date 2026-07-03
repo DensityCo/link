@@ -1,15 +1,15 @@
 use crate::client::{ClientError, ClientEvent};
+use crate::deployment::{Deployment, DeploymentEvent, DeploymentManager};
 use crate::protocol::{
     progress_payload, ChannelBuilder, ProgressStage, ProtocolEvent, UpdateStatus,
 };
-use crate::update::{UpdateInfo, UpdateManager, UpdateRunEvent};
 use futures_util::SinkExt;
 use tokio::sync::mpsc;
 use tracing::info;
 
-pub async fn handle_update<S>(
-    update_manager: UpdateManager,
-    update_info: UpdateInfo,
+pub async fn handle_deployment<S>(
+    deployment_manager: DeploymentManager,
+    deployment: Deployment,
     channel: &ChannelBuilder,
     write: &mut S,
     event_tx: &mpsc::Sender<ClientEvent>,
@@ -19,8 +19,8 @@ where
     S::Error: std::fmt::Display,
 {
     info!(
-        uuid = %update_info.firmware_meta.uuid,
-        version = %update_info.firmware_meta.version,
+        uuid = %deployment.firmware_meta.uuid,
+        version = %deployment.firmware_meta.version,
         "downloading firmware"
     );
 
@@ -32,10 +32,10 @@ where
     )
     .await?;
 
-    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<UpdateRunEvent>();
-    let update_handle = tokio::spawn(async move {
-        update_manager
-            .run(update_info, move |event| {
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DeploymentEvent>();
+    let deployment_handle = tokio::spawn(async move {
+        deployment_manager
+            .run(deployment, move |event| {
                 let _ = progress_tx.send(event);
             })
             .await
@@ -55,7 +55,7 @@ where
     let mut last_reported_percent: u8 = 0;
     while let Some(event) = progress_rx.recv().await {
         match event {
-            UpdateRunEvent::DownloadProgress(pct) => {
+            DeploymentEvent::DownloadProgress(pct) => {
                 let should_report = pct > last_reported_percent + 4 || pct == 100;
 
                 if should_report {
@@ -64,21 +64,21 @@ where
                     if let Err(error) =
                         push(channel, write, ProtocolEvent::FwupProgress, progress_msg).await
                     {
-                        update_handle.abort();
+                        deployment_handle.abort();
                         return Err(error);
                     }
                 }
             }
-            UpdateRunEvent::FirmwareDownloaded(path) => {
+            DeploymentEvent::FirmwareDownloaded(path) => {
                 info!(path = %path.display(), "firmware downloaded");
                 let _ = event_tx.send(ClientEvent::FirmwareDownloaded(path)).await;
             }
         }
     }
 
-    match update_handle
+    match deployment_handle
         .await
-        .map_err(|e| ClientError::Connection(format!("update task failed: {}", e)))?
+        .map_err(|e| ClientError::Connection(format!("deployment task failed: {}", e)))?
     {
         Ok(_firmware_path) => {}
         Err(error) => {
@@ -90,7 +90,7 @@ where
                 UpdateStatus::Failed { reason }.payload(),
             )
             .await;
-            return Err(ClientError::Update(error));
+            return Err(ClientError::Deployment(error));
         }
     }
 

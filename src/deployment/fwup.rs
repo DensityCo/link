@@ -1,4 +1,4 @@
-use crate::update::UpdateError;
+use crate::deployment::DeploymentError;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -7,7 +7,7 @@ pub async fn apply_firmware(
     firmware_path: &Path,
     devpath: &str,
     task: &str,
-) -> Result<(), UpdateError> {
+) -> Result<(), DeploymentError> {
     info!(
         firmware = %firmware_path.display(),
         devpath,
@@ -25,12 +25,12 @@ pub async fn apply_firmware(
         .arg(task)
         .output()
         .await
-        .map_err(|e| UpdateError::Fwup(format!("failed to execute fwup: {}", e)))?;
+        .map_err(|e| DeploymentError::Fwup(format!("failed to execute fwup: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!(stderr = %stderr, "fwup failed");
-        return Err(UpdateError::Fwup(format!(
+        return Err(DeploymentError::Fwup(format!(
             "fwup exit {}: {}",
             output.status,
             stderr.trim()

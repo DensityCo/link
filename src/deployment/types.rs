@@ -1,10 +1,10 @@
-use crate::update::UpdateError;
+use crate::deployment::DeploymentError;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Parsed firmware update info from the server's "update" event.
+/// Parsed deployment request from the server's "update" event.
 #[derive(Debug, Clone, Deserialize)]
-pub struct UpdateInfo {
+pub struct Deployment {
     pub firmware_url: String,
     pub firmware_meta: FirmwareMeta,
 }
@@ -19,11 +19,11 @@ pub struct FirmwareMeta {
     pub product: String,
 }
 
-impl UpdateInfo {
-    /// Parse an update message payload.
-    pub fn from_payload(payload: &Value) -> Result<Self, UpdateError> {
+impl Deployment {
+    /// Parse a deployment message payload.
+    pub fn from_payload(payload: &Value) -> Result<Self, DeploymentError> {
         serde_json::from_value(payload.clone())
-            .map_err(|e| UpdateError::InvalidMessage(e.to_string()))
+            .map_err(|e| DeploymentError::InvalidMessage(e.to_string()))
     }
 }
 
@@ -33,7 +33,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_update_info() {
+    fn parse_deployment() {
         let payload = json!({
             "firmware_url": "https://s3.example.com/fw.fw?token=abc",
             "firmware_meta": {
@@ -44,16 +44,19 @@ mod tests {
                 "product": "my-product"
             }
         });
-        let info = UpdateInfo::from_payload(&payload).unwrap();
-        assert_eq!(info.firmware_url, "https://s3.example.com/fw.fw?token=abc");
-        assert_eq!(info.firmware_meta.uuid, "abc-123");
-        assert_eq!(info.firmware_meta.version, "1.1.0");
-        assert_eq!(info.firmware_meta.platform, "rpi4");
+        let deployment = Deployment::from_payload(&payload).unwrap();
+        assert_eq!(
+            deployment.firmware_url,
+            "https://s3.example.com/fw.fw?token=abc"
+        );
+        assert_eq!(deployment.firmware_meta.uuid, "abc-123");
+        assert_eq!(deployment.firmware_meta.version, "1.1.0");
+        assert_eq!(deployment.firmware_meta.platform, "rpi4");
     }
 
     #[test]
-    fn parse_invalid_update() {
+    fn parse_invalid_deployment() {
         let payload = json!({"missing": "fields"});
-        assert!(UpdateInfo::from_payload(&payload).is_err());
+        assert!(Deployment::from_payload(&payload).is_err());
     }
 }

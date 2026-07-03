@@ -1,6 +1,6 @@
 # link
 
-A Rust library and daemon for Fabric Fleet's device update protocol. It connects over WebSocket/Phoenix Channels, receives firmware updates, downloads them, and applies them through a configurable installer. The default daemon installer uses `fwup`.
+A Rust library and daemon for Fabric Fleet's device deployment protocol. It connects over WebSocket/Phoenix Channels, receives deployment requests, downloads firmware, and applies it through a configurable installer. The default daemon installer uses `fwup`.
 
 The library is intentionally platform agnostic. It does not read Nerves KV, call `Nerves.Runtime`, or know how a device stores its identity. Callers provide serial number, firmware metadata, and runtime state through config, direct `DeviceInfo`, or the `DeviceInfoProvider` trait.
 
@@ -117,11 +117,11 @@ Applications embedding the library can omit `serial_number` from config and pass
 
 ### Firmware installer
 
-The default daemon path builds a `FwupInstaller` from `fwup_devpath` and `fwup_task`. Library callers can provide their own installer by constructing an `UpdateManager` with a custom `FirmwareInstaller` and setting it on the client:
+The default daemon path builds a `FwupInstaller` from `fwup_devpath` and `fwup_task`. Library callers can provide their own installer by constructing a `DeploymentManager` with a custom `FirmwareInstaller` and setting it on the client:
 
 ```rust
-let update_manager = UpdateManager::with_installer(options, installer);
-client.set_update_manager(update_manager);
+let deployment_manager = DeploymentManager::with_installer(options, installer);
+client.set_deployment_manager(deployment_manager);
 ```
 
 ### Health reports
@@ -145,7 +145,7 @@ On startup, `link`:
 5. Joins the extensions channel when requested and reports health if the server selects the `health` extension
 6. Joins the console channel when `[console].enabled = true`
 7. Sends heartbeats every 30 seconds
-8. Listens for `update` events containing a firmware URL
+8. Listens for wire-level `update` events containing a firmware URL
 9. Downloads the firmware to `data_dir` as `firmware-{uuid}.fw.tmp`, then renames it to `firmware-{uuid}.fw`
 10. Applies it through the configured installer
 11. Reports staged progress and completion to the server

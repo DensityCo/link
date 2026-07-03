@@ -1,4 +1,4 @@
-use crate::update::{apply_firmware, UpdateError, UpdateInfo};
+use crate::deployment::{apply_firmware, Deployment, DeploymentError};
 use futures_util::future::BoxFuture;
 use std::path::Path;
 
@@ -6,8 +6,8 @@ pub trait FirmwareInstaller: Send + Sync {
     fn apply<'a>(
         &'a self,
         firmware_path: &'a Path,
-        update_info: &'a UpdateInfo,
-    ) -> BoxFuture<'a, Result<(), UpdateError>>;
+        deployment: &'a Deployment,
+    ) -> BoxFuture<'a, Result<(), DeploymentError>>;
 }
 
 #[derive(Debug, Clone)]
@@ -37,8 +37,8 @@ impl FirmwareInstaller for FwupInstaller {
     fn apply<'a>(
         &'a self,
         firmware_path: &'a Path,
-        _update_info: &'a UpdateInfo,
-    ) -> BoxFuture<'a, Result<(), UpdateError>> {
+        _deployment: &'a Deployment,
+    ) -> BoxFuture<'a, Result<(), DeploymentError>> {
         Box::pin(async move { apply_firmware(firmware_path, &self.devpath, &self.task).await })
     }
 }

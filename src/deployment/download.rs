@@ -1,4 +1,4 @@
-use crate::update::{UpdateError, UpdateInfo};
+use crate::deployment::{Deployment, DeploymentError};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -6,31 +6,34 @@ use tracing::info;
 ///
 /// Reports progress via a callback: fn(bytes_downloaded, total_bytes_option).
 pub async fn download_firmware<F>(
-    update_info: &UpdateInfo,
+    deployment: &Deployment,
     dest_dir: &Path,
     mut on_progress: F,
-) -> Result<PathBuf, UpdateError>
+) -> Result<PathBuf, DeploymentError>
 where
     F: FnMut(u64, Option<u64>),
 {
     let client = reqwest::Client::new();
     let response = client
-        .get(&update_info.firmware_url)
+        .get(&deployment.firmware_url)
         .send()
         .await
-        .map_err(|e| UpdateError::Download(e.to_string()))?;
+        .map_err(|e| DeploymentError::Download(e.to_string()))?;
 
     if !response.status().is_success() {
-        return Err(UpdateError::Download(format!("HTTP {}", response.status())));
+        return Err(DeploymentError::Download(format!(
+            "HTTP {}",
+            response.status()
+        )));
     }
 
     let total_size = response.content_length();
-    let file_stem = firmware_file_stem(&update_info.firmware_meta.uuid);
+    let file_stem = firmware_file_stem(&deployment.firmware_meta.uuid);
     let dest_path = dest_dir.join(format!("{}.fw", file_stem));
     let temp_path = dest_dir.join(format!("{}.fw.tmp", file_stem));
     let mut file = tokio::fs::File::create(&temp_path)
         .await
-        .map_err(UpdateError::Io)?;
+        .map_err(DeploymentError::Io)?;
 
     let mut downloaded: u64 = 0;
     let mut stream = response.bytes_stream();
@@ -39,18 +42,18 @@ where
     use tokio::io::AsyncWriteExt;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| UpdateError::Download(e.to_string()))?;
-        file.write_all(&chunk).await.map_err(UpdateError::Io)?;
+        let chunk = chunk.map_err(|e| DeploymentError::Download(e.to_string()))?;
+        file.write_all(&chunk).await.map_err(DeploymentError::Io)?;
         downloaded += chunk.len() as u64;
         on_progress(downloaded, total_size);
     }
 
-    file.flush().await.map_err(UpdateError::Io)?;
+    file.flush().await.map_err(DeploymentError::Io)?;
     drop(file);
     let _ = tokio::fs::remove_file(&dest_path).await;
     tokio::fs::rename(&temp_path, &dest_path)
         .await
-        .map_err(UpdateError::Io)?;
+        .map_err(DeploymentError::Io)?;
     info!(downloaded_bytes = downloaded, path = %dest_path.display(), "firmware download complete");
 
     Ok(dest_path)

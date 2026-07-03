@@ -3,6 +3,7 @@ use crate::console::{
     ConsoleBackend, ConsoleError, ConsoleFileReceiver, ConsoleOutput, ConsoleSession,
     PtyConsoleBackend,
 };
+use crate::deployment::{self, Deployment, DeploymentManager};
 use crate::device::{DeviceInfo, DeviceInfoError, DeviceInfoProvider};
 use crate::extensions::{
     available_extensions_payload, extension_requested, HealthReporter, SystemHealthReporter,
@@ -10,7 +11,6 @@ use crate::extensions::{
 };
 use crate::protocol::{ChannelBuilder, Message, ProtocolEvent};
 use crate::transport;
-use crate::update::{self, UpdateInfo, UpdateManager};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::Arc;
@@ -35,8 +35,8 @@ pub enum ClientError {
     DeviceInfoProvider(String),
     #[error("transport error: {0}")]
     Transport(#[from] transport::TransportError),
-    #[error("update error: {0}")]
-    Update(#[from] update::UpdateError),
+    #[error("deployment error: {0}")]
+    Deployment(#[from] deployment::DeploymentError),
     #[error("console error: {0}")]
     Console(#[from] ConsoleError),
     #[error("channel closed")]
@@ -53,7 +53,7 @@ pub enum ClientEvent {
     ConsoleStarted,
     ConsoleStopped,
     HealthReported,
-    UpdateAvailable(UpdateInfo),
+    DeploymentAvailable(Deployment),
     FirmwareDownloaded(std::path::PathBuf),
     FirmwareApplied,
     RebootRequested,
@@ -64,7 +64,7 @@ pub enum ClientEvent {
 pub struct LinkClient {
     config: Config,
     device_info: DeviceInfo,
-    update_manager: UpdateManager,
+    deployment_manager: DeploymentManager,
     health_reporter: Arc<dyn HealthReporter>,
     console_backend: Option<Arc<dyn ConsoleBackend>>,
 }
@@ -81,7 +81,7 @@ impl LinkClient {
 
     pub fn with_device_info(config: Config, device_info: DeviceInfo) -> Result<Self, ClientError> {
         device_info.validate()?;
-        let update_manager = UpdateManager::from_config(&config);
+        let deployment_manager = DeploymentManager::from_config(&config);
         let console_backend = config
             .console
             .as_ref()
@@ -92,7 +92,7 @@ impl LinkClient {
         Ok(Self {
             config,
             device_info,
-            update_manager,
+            deployment_manager,
             health_reporter: Arc::new(SystemHealthReporter),
             console_backend,
         })
@@ -114,12 +114,12 @@ impl LinkClient {
         Ok(())
     }
 
-    pub fn set_update_manager(&mut self, update_manager: UpdateManager) {
-        self.update_manager = update_manager;
+    pub fn set_deployment_manager(&mut self, deployment_manager: DeploymentManager) {
+        self.deployment_manager = deployment_manager;
     }
 
-    pub fn with_update_manager(mut self, update_manager: UpdateManager) -> Self {
-        self.update_manager = update_manager;
+    pub fn with_deployment_manager(mut self, deployment_manager: DeploymentManager) -> Self {
+        self.deployment_manager = deployment_manager;
         self
     }
 
@@ -385,15 +385,15 @@ impl LinkClient {
                 info!("sent extensions channel join");
             }
             Some(ProtocolEvent::Update) => {
-                info!("received firmware update");
-                match UpdateInfo::from_payload(&msg.payload) {
-                    Ok(update_info) => {
+                info!("received deployment request");
+                match Deployment::from_payload(&msg.payload) {
+                    Ok(deployment) => {
                         let _ = event_tx
-                            .send(ClientEvent::UpdateAvailable(update_info.clone()))
+                            .send(ClientEvent::DeploymentAvailable(deployment.clone()))
                             .await;
-                        crate::client_update::handle_update(
-                            self.update_manager.clone(),
-                            update_info,
+                        crate::client_deployment::handle_deployment(
+                            self.deployment_manager.clone(),
+                            deployment,
                             device_channel,
                             write,
                             event_tx,
@@ -401,7 +401,7 @@ impl LinkClient {
                         .await?;
                     }
                     Err(e) => {
-                        warn!(error = %e, "failed to parse update message");
+                        warn!(error = %e, "failed to parse deployment message");
                     }
                 }
             }
