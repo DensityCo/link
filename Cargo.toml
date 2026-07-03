@@ -14,9 +14,8 @@ strip = true
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tungstenite = "0.24"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-webpki-roots = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
@@ -26,11 +25,9 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 base64 = "0.22"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 thiserror = "2"
-url = "2"
 futures-util = "0.3"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rand = "0.8"
 sysinfo = "0.39.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
