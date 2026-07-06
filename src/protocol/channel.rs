@@ -1,6 +1,7 @@
 use crate::protocol::events::ProtocolEvent;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -76,14 +77,15 @@ impl Message {
 }
 
 /// Reference counter for Phoenix Channels messages.
+#[derive(Clone)]
 pub struct RefCounter {
-    next: AtomicU64,
+    next: Arc<AtomicU64>,
 }
 
 impl RefCounter {
     pub fn new() -> Self {
         Self {
-            next: AtomicU64::new(1),
+            next: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -93,6 +95,7 @@ impl RefCounter {
 }
 
 /// Builds Phoenix Channels protocol messages.
+#[derive(Clone)]
 pub struct ChannelBuilder {
     pub topic: String,
     pub join_ref: String,

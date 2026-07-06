@@ -9,13 +9,16 @@ use crate::extensions::{
     available_extensions_payload, extension_requested, HealthReporter, SystemHealthReporter,
     HEALTH_EXTENSION_NAME,
 };
+use crate::outbound::{self, OutboundSender};
 use crate::protocol::{ChannelBuilder, Message, ProtocolEvent};
 use crate::transport;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -41,6 +44,12 @@ pub enum ClientError {
     Console(#[from] ConsoleError),
     #[error("channel closed")]
     ChannelClosed,
+}
+
+impl From<crate::outbound::OutboundError> for ClientError {
+    fn from(error: crate::outbound::OutboundError) -> Self {
+        ClientError::WebSocket(error.to_string())
+    }
 }
 
 /// Events that the client can emit to the caller.
@@ -195,13 +204,35 @@ impl LinkClient {
         info!("joined device channel");
         let _ = event_tx.send(ClientEvent::Joined).await;
 
+        let (outbound_tx, mut outbound_rx) = outbound::channel();
+        let (connection_error_tx, mut connection_error_rx) = mpsc::unbounded_channel();
+        let mut background_tasks = BackgroundTasks::new();
+        let writer_error_tx = connection_error_tx.clone();
+        background_tasks.spawn(async move {
+            while let Some(outbound) = outbound_rx.recv().await {
+                match write
+                    .send(tungstenite::Message::Text(
+                        outbound.message.to_json().into(),
+                    ))
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = outbound.result_tx.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        let _ = outbound.result_tx.send(Err(reason.clone()));
+                        let _ = writer_error_tx.send(ClientError::WebSocket(reason));
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut console_channel = if self.console_backend.is_some() {
             let channel = ChannelBuilder::new("console".to_string());
             let join_msg = channel.join(self.join_payload());
-            write
-                .send(tungstenite::Message::Text(join_msg.to_json().into()))
-                .await
-                .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+            outbound_tx.send(join_msg).await?;
             info!("sent console channel join");
             Some(channel)
         } else {
@@ -239,7 +270,9 @@ impl LinkClient {
                                         &console_output_tx,
                                         &mut console_deadline,
                                         &mut console_file_receiver,
-                                        &mut write,
+                                        &outbound_tx,
+                                        &connection_error_tx,
+                                        &mut background_tasks,
                                         &event_tx,
                                     )
                                     .await?;
@@ -250,6 +283,12 @@ impl LinkClient {
                             }
                         }
                         Some(Ok(tungstenite::Message::Close(_))) | None => {
+                            if let Ok(error) = connection_error_rx.try_recv() {
+                                let reason = error.to_string();
+                                error!(error = %reason, "connection task failed before close");
+                                let _ = event_tx.send(ClientEvent::Disconnected(reason)).await;
+                                return Err(error);
+                            }
                             info!("connection closed");
                             let _ = event_tx.send(ClientEvent::Disconnected("connection closed".to_string())).await;
                             return Ok(());
@@ -266,10 +305,7 @@ impl LinkClient {
                 }
                 _ = tokio::time::sleep_until(next_heartbeat) => {
                     let hb = channel.heartbeat();
-                    write
-                        .send(tungstenite::Message::Text(hb.to_json().into()))
-                        .await
-                        .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+                    outbound_tx.send(hb).await?;
                     debug!("sent heartbeat");
                     next_heartbeat = Instant::now() + heartbeat_interval;
                 }
@@ -278,7 +314,7 @@ impl LinkClient {
                         output,
                         console_channel.as_ref(),
                         &mut console_deadline,
-                        &mut write,
+                        &outbound_tx,
                     )
                     .await?;
                 }
@@ -287,10 +323,16 @@ impl LinkClient {
                         &mut console_session,
                         console_channel.as_ref(),
                         &mut console_deadline,
-                        &mut write,
+                        &outbound_tx,
                         &event_tx,
                     )
                     .await?;
+                }
+                Some(error) = connection_error_rx.recv() => {
+                    let reason = error.to_string();
+                    error!(error = %reason, "connection task failed");
+                    let _ = event_tx.send(ClientEvent::Disconnected(reason)).await;
+                    return Err(error);
                 }
             }
         }
@@ -327,7 +369,7 @@ impl LinkClient {
         }
     }
 
-    async fn handle_message<S>(
+    async fn handle_message(
         &self,
         msg: Message,
         device_channel: &ChannelBuilder,
@@ -338,19 +380,17 @@ impl LinkClient {
         console_output_tx: &mpsc::UnboundedSender<ConsoleOutput>,
         console_deadline: &mut Option<Instant>,
         console_file_receiver: &mut ConsoleFileReceiver,
-        write: &mut S,
+        outbound_tx: &OutboundSender,
+        connection_error_tx: &mpsc::UnboundedSender<ClientError>,
+        background_tasks: &mut BackgroundTasks,
         event_tx: &mpsc::Sender<ClientEvent>,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+    ) -> Result<(), ClientError> {
         if msg.topic == "extensions" {
             self.handle_extensions_message(
                 msg,
                 extensions_channel,
                 health_attached,
-                write,
+                outbound_tx,
                 event_tx,
             )
             .await?;
@@ -365,7 +405,7 @@ impl LinkClient {
                 console_output_tx,
                 console_deadline,
                 console_file_receiver,
-                write,
+                outbound_tx,
                 event_tx,
             )
             .await?;
@@ -377,10 +417,7 @@ impl LinkClient {
                 info!("received extensions request");
                 let channel = ChannelBuilder::new("extensions".to_string());
                 let join_msg = channel.join(available_extensions_payload());
-                write
-                    .send(tungstenite::Message::Text(join_msg.to_json().into()))
-                    .await
-                    .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+                outbound_tx.send(join_msg).await?;
                 *extensions_channel = Some(channel);
                 info!("sent extensions channel join");
             }
@@ -391,14 +428,24 @@ impl LinkClient {
                         let _ = event_tx
                             .send(ClientEvent::DeploymentAvailable(deployment.clone()))
                             .await;
-                        crate::client_deployment::handle_deployment(
-                            self.deployment_manager.clone(),
-                            deployment,
-                            device_channel,
-                            write,
-                            event_tx,
-                        )
-                        .await?;
+                        let deployment_manager = self.deployment_manager.clone();
+                        let deployment_channel = device_channel.clone();
+                        let deployment_outbound_tx = outbound_tx.clone();
+                        let deployment_event_tx = event_tx.clone();
+                        let deployment_error_tx = connection_error_tx.clone();
+                        background_tasks.spawn(async move {
+                            if let Err(error) = crate::client_deployment::handle_deployment(
+                                deployment_manager,
+                                deployment,
+                                deployment_channel,
+                                deployment_outbound_tx,
+                                deployment_event_tx,
+                            )
+                            .await
+                            {
+                                let _ = deployment_error_tx.send(error);
+                            }
+                        });
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to parse deployment message");
@@ -407,9 +454,8 @@ impl LinkClient {
             }
             Some(ProtocolEvent::Reboot) => {
                 info!("received reboot command");
-                let ack = device_channel.push(ProtocolEvent::Rebooting, json!({}));
-                let _ = write
-                    .send(tungstenite::Message::Text(ack.to_json().into()))
+                let _ = outbound_tx
+                    .push(device_channel, ProtocolEvent::Rebooting, json!({}))
                     .await;
                 let _ = event_tx.send(ClientEvent::RebootRequested).await;
             }
@@ -442,7 +488,7 @@ impl LinkClient {
         Ok(())
     }
 
-    async fn handle_console_message<S>(
+    async fn handle_console_message(
         &self,
         msg: Message,
         console_channel: &mut Option<ChannelBuilder>,
@@ -450,13 +496,9 @@ impl LinkClient {
         console_output_tx: &mpsc::UnboundedSender<ConsoleOutput>,
         console_deadline: &mut Option<Instant>,
         console_file_receiver: &mut ConsoleFileReceiver,
-        write: &mut S,
+        outbound_tx: &OutboundSender,
         event_tx: &mpsc::Sender<ClientEvent>,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+    ) -> Result<(), ClientError> {
         if msg.is_reply() {
             debug!(
                 ref_id = ?msg.msg_ref,
@@ -518,7 +560,7 @@ impl LinkClient {
             "restart" => {
                 self.stop_console_session(console_session, console_deadline, event_tx)
                     .await?;
-                self.push_console_text(channel, "\r*** Restarting shell ***\r", write)
+                self.push_console_text(channel, "\r*** Restarting shell ***\r", outbound_tx)
                     .await?;
                 self.ensure_console_session(
                     console_session,
@@ -543,7 +585,7 @@ impl LinkClient {
                         self.push_console_text(
                             channel,
                             &format!("\rconsole file upload failed: {error}\r\n"),
-                            write,
+                            outbound_tx,
                         )
                         .await?;
                     }
@@ -562,7 +604,7 @@ impl LinkClient {
                     self.push_console_text(
                         channel,
                         &format!("\rconsole file upload failed: {error}\r\n"),
-                        write,
+                        outbound_tx,
                     )
                     .await?;
                 }
@@ -580,18 +622,14 @@ impl LinkClient {
         Ok(())
     }
 
-    async fn handle_extensions_message<S>(
+    async fn handle_extensions_message(
         &self,
         msg: Message,
         extensions_channel: &mut Option<ChannelBuilder>,
         health_attached: &mut bool,
-        write: &mut S,
+        outbound_tx: &OutboundSender,
         event_tx: &mpsc::Sender<ClientEvent>,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+    ) -> Result<(), ClientError> {
         if msg.is_reply() {
             debug!(
                 ref_id = ?msg.msg_ref,
@@ -606,9 +644,11 @@ impl LinkClient {
                     let _ = event_tx.send(ClientEvent::ExtensionsJoined).await;
                     let response = msg.payload.get("response").unwrap_or(&msg.payload);
                     if extension_requested(response, HEALTH_EXTENSION_NAME) {
-                        let attached = self.attach_health(channel, health_attached, write).await?;
+                        let attached = self
+                            .attach_health(channel, health_attached, outbound_tx)
+                            .await?;
                         if attached {
-                            self.report_health(channel, write, event_tx).await?;
+                            self.report_health(channel, outbound_tx, event_tx).await?;
                         }
                     } else {
                         info!(
@@ -629,20 +669,23 @@ impl LinkClient {
         match msg.event.as_str() {
             "attach" => {
                 if extension_requested(&msg.payload, HEALTH_EXTENSION_NAME) {
-                    let attached = self.attach_health(channel, health_attached, write).await?;
+                    let attached = self
+                        .attach_health(channel, health_attached, outbound_tx)
+                        .await?;
                     if attached {
-                        self.report_health(channel, write, event_tx).await?;
+                        self.report_health(channel, outbound_tx, event_tx).await?;
                     }
                 }
             }
             "detach" => {
                 if extension_requested(&msg.payload, HEALTH_EXTENSION_NAME) {
-                    self.detach_health(channel, health_attached, write).await?;
+                    self.detach_health(channel, health_attached, outbound_tx)
+                        .await?;
                 }
             }
             "health:check" => {
                 if *health_attached {
-                    self.report_health(channel, write, event_tx).await?;
+                    self.report_health(channel, outbound_tx, event_tx).await?;
                 } else {
                     warn!("health check requested before health extension attached");
                 }
@@ -655,22 +698,16 @@ impl LinkClient {
         Ok(())
     }
 
-    async fn attach_health<S>(
+    async fn attach_health(
         &self,
         channel: &ChannelBuilder,
         health_attached: &mut bool,
-        write: &mut S,
-    ) -> Result<bool, ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+        outbound_tx: &OutboundSender,
+    ) -> Result<bool, ClientError> {
         if !*health_attached {
-            let msg = channel.push_custom("health:attached", json!({}));
-            write
-                .send(tungstenite::Message::Text(msg.to_json().into()))
-                .await
-                .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+            outbound_tx
+                .push_custom(channel, "health:attached", json!({}))
+                .await?;
             *health_attached = true;
             info!("attached health extension");
             return Ok(true);
@@ -678,44 +715,32 @@ impl LinkClient {
         Ok(false)
     }
 
-    async fn detach_health<S>(
+    async fn detach_health(
         &self,
         channel: &ChannelBuilder,
         health_attached: &mut bool,
-        write: &mut S,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+        outbound_tx: &OutboundSender,
+    ) -> Result<(), ClientError> {
         if *health_attached {
-            let msg = channel.push_custom("health:detached", json!({}));
-            write
-                .send(tungstenite::Message::Text(msg.to_json().into()))
-                .await
-                .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+            outbound_tx
+                .push_custom(channel, "health:detached", json!({}))
+                .await?;
             *health_attached = false;
             info!("detached health extension");
         }
         Ok(())
     }
 
-    async fn report_health<S>(
+    async fn report_health(
         &self,
         channel: &ChannelBuilder,
-        write: &mut S,
+        outbound_tx: &OutboundSender,
         event_tx: &mpsc::Sender<ClientEvent>,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+    ) -> Result<(), ClientError> {
         let report = self.health_reporter.report();
-        let msg = channel.push_custom("health:report", json!({ "value": report }));
-        write
-            .send(tungstenite::Message::Text(msg.to_json().into()))
-            .await
-            .map_err(|e| ClientError::WebSocket(e.to_string()))?;
+        outbound_tx
+            .push_custom(channel, "health:report", json!({ "value": report }))
+            .await?;
         let _ = event_tx.send(ClientEvent::HealthReported).await;
         info!("reported health");
         Ok(())
@@ -762,23 +787,19 @@ impl LinkClient {
         Ok(())
     }
 
-    async fn stop_console_for_timeout<S>(
+    async fn stop_console_for_timeout(
         &self,
         console_session: &mut Option<Box<dyn ConsoleSession>>,
         console_channel: Option<&ChannelBuilder>,
         console_deadline: &mut Option<Instant>,
-        write: &mut S,
+        outbound_tx: &OutboundSender,
         event_tx: &mpsc::Sender<ClientEvent>,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+    ) -> Result<(), ClientError> {
         if let Some(channel) = console_channel {
             self.push_console_text(
                 channel,
                 "\r****************************************\r\n*   Session timeout due to inactivity  *\r\n*                                      *\r\n*   Press any key to continue...       *\r\n****************************************\r\n",
-                write,
+                outbound_tx,
             )
             .await?;
         }
@@ -787,44 +808,36 @@ impl LinkClient {
             .await
     }
 
-    async fn forward_console_output<S>(
+    async fn forward_console_output(
         &self,
         output: ConsoleOutput,
         console_channel: Option<&ChannelBuilder>,
         console_deadline: &mut Option<Instant>,
-        write: &mut S,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+        outbound_tx: &OutboundSender,
+    ) -> Result<(), ClientError> {
         let Some(channel) = console_channel else {
             return Ok(());
         };
 
         self.reset_console_deadline(console_deadline);
-        self.push_console_text(channel, &output.data, write).await
+        self.push_console_text(channel, &output.data, outbound_tx)
+            .await
     }
 
-    async fn push_console_text<S>(
+    async fn push_console_text(
         &self,
         channel: &ChannelBuilder,
         data: &str,
-        write: &mut S,
-    ) -> Result<(), ClientError>
-    where
-        S: SinkExt<tungstenite::Message> + Unpin,
-        S::Error: std::fmt::Display,
-    {
+        outbound_tx: &OutboundSender,
+    ) -> Result<(), ClientError> {
         if data.is_empty() {
             return Ok(());
         }
 
-        let msg = channel.push_custom("up", json!({ "data": data }));
-        write
-            .send(tungstenite::Message::Text(msg.to_json().into()))
-            .await
-            .map_err(|e| ClientError::WebSocket(e.to_string()))
+        outbound_tx
+            .push_custom(channel, "up", json!({ "data": data }))
+            .await?;
+        Ok(())
     }
 
     fn reset_console_deadline(&self, console_deadline: &mut Option<Instant>) {
@@ -834,6 +847,34 @@ impl LinkClient {
             .as_ref()
             .map_or(5 * 60, |console| console.timeout_secs());
         *console_deadline = Some(Instant::now() + Duration::from_secs(timeout_secs));
+    }
+}
+
+struct BackgroundTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn spawn<F>(&mut self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.handles.retain(|handle| !handle.is_finished());
+        self.handles.push(tokio::spawn(future));
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
     }
 }
 

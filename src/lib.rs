@@ -6,6 +6,7 @@ pub mod console;
 pub mod deployment;
 pub mod device;
 pub mod extensions;
+mod outbound;
 pub mod protocol;
 pub mod runner;
 mod tls;

@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
 const FIRMWARE_BODY: &[u8] = b"test firmware bytes";
 const TEST_UUID: &str = "integration-fw-uuid";
@@ -155,6 +155,25 @@ async fn deployment_update_reports_failed_when_installer_fails() {
         .any(|event| matches!(event, ClientEvent::FirmwareApplied)));
 }
 
+#[tokio::test]
+async fn deployment_update_does_not_block_heartbeats_during_slow_download() {
+    let mut fixture = TestFixture::start_with_firmware_delay(Duration::from_millis(2200)).await;
+    fixture.config.heartbeat_interval_secs = Some(1);
+    let installs = Arc::new(Mutex::new(Vec::new()));
+    let installer = RecordingInstaller::successful(Arc::clone(&installs));
+    let result = run_client_against_update_server(&fixture, installer).await;
+
+    result.client_result.unwrap();
+    assert!(result
+        .server_messages
+        .iter()
+        .any(|message| message.topic == "phoenix" && message.event == "heartbeat"));
+    assert!(result.server_messages.iter().any(|message| {
+        message.event == "status_update"
+            && message.payload.get("status").and_then(Value::as_str) == Some("completed")
+    }));
+}
+
 struct TestFixture {
     _temp_dir: TempDir,
     config: Config,
@@ -164,8 +183,12 @@ struct TestFixture {
 
 impl TestFixture {
     async fn start() -> Self {
+        Self::start_with_firmware_delay(Duration::ZERO).await
+    }
+
+    async fn start_with_firmware_delay(response_delay: Duration) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
-        let firmware_url = spawn_firmware_server().await;
+        let firmware_url = spawn_firmware_server(response_delay).await;
         let config = Config {
             host: "ws://127.0.0.1:0".to_string(),
             auth: AuthConfig::SharedSecret {
@@ -288,7 +311,7 @@ async fn run_update_server(listener: TcpListener, firmware_url: String) -> Vec<M
     }
 }
 
-async fn spawn_firmware_server() -> String {
+async fn spawn_firmware_server(response_delay: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -296,6 +319,7 @@ async fn spawn_firmware_server() -> String {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0; 1024];
         let _ = stream.read(&mut request).await.unwrap();
+        sleep(response_delay).await;
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             FIRMWARE_BODY.len()
