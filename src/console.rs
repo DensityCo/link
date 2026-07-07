@@ -63,7 +63,7 @@ pub struct ConsoleOutput {
 pub trait ConsoleBackend: Send + Sync {
     fn start(
         &self,
-        output_tx: mpsc::UnboundedSender<ConsoleOutput>,
+        output_tx: mpsc::Sender<ConsoleOutput>,
     ) -> Result<Box<dyn ConsoleSession>, ConsoleError>;
 }
 
@@ -139,7 +139,7 @@ impl PtyConsoleBackend {
 impl ConsoleBackend for PtyConsoleBackend {
     fn start(
         &self,
-        output_tx: mpsc::UnboundedSender<ConsoleOutput>,
+        output_tx: mpsc::Sender<ConsoleOutput>,
     ) -> Result<Box<dyn ConsoleSession>, ConsoleError> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -171,7 +171,7 @@ impl ConsoleBackend for PtyConsoleBackend {
                     Ok(0) => break,
                     Ok(count) => {
                         let data = String::from_utf8_lossy(&buffer[..count]).to_string();
-                        if output_tx.send(ConsoleOutput { data }).is_err() {
+                        if output_tx.blocking_send(ConsoleOutput { data }).is_err() {
                             break;
                         }
                     }
@@ -265,7 +265,7 @@ mod tests {
             rows: 24,
             cols: 80,
         });
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(32);
         let mut session = backend.start(tx).unwrap();
 
         session

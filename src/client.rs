@@ -1,9 +1,13 @@
+use crate::alarms::{AlarmStore, FIRMWARE_REVERTED_ALARM};
 use crate::config::{Config, ConfigError};
 use crate::connection::{ConnectionLoop, ConnectionParts};
 use crate::console::{ConsoleBackend, ConsoleError, PtyConsoleBackend};
 use crate::deployment::{self, Deployment, DeploymentManager};
 use crate::device::{DeviceInfo, DeviceInfoError, DeviceInfoProvider};
 use crate::extensions::{HealthReporter, SystemHealthReporter};
+use crate::identify::{IdentifyAction, IdentifyController, IdentifyError};
+use crate::reboot::{RebootController, RebootError, Rebooter};
+use crate::scripts::{ScriptController, ScriptRunner};
 use crate::transport;
 use std::sync::Arc;
 use thiserror::Error;
@@ -30,14 +34,12 @@ pub enum ClientError {
     Deployment(#[from] deployment::DeploymentError),
     #[error("console error: {0}")]
     Console(#[from] ConsoleError),
+    #[error("reboot error: {0}")]
+    Reboot(#[from] RebootError),
+    #[error("identify error: {0}")]
+    Identify(#[from] IdentifyError),
     #[error("channel closed")]
     ChannelClosed,
-}
-
-impl From<crate::outbound::OutboundError> for ClientError {
-    fn from(error: crate::outbound::OutboundError) -> Self {
-        ClientError::WebSocket(error.to_string())
-    }
 }
 
 /// Events that the client can emit to the caller.
@@ -54,6 +56,10 @@ pub enum ClientEvent {
     FirmwareDownloaded(std::path::PathBuf),
     FirmwareApplied,
     RebootRequested,
+    IdentifyRequested,
+    ScriptRequested(String),
+    ScriptCompleted(String),
+    ScriptFailed { script_ref: String, reason: String },
     Disconnected(String),
 }
 
@@ -64,6 +70,10 @@ pub struct LinkClient {
     deployment_manager: DeploymentManager,
     health_reporter: Arc<dyn HealthReporter>,
     console_backend: Option<Arc<dyn ConsoleBackend>>,
+    reboot_controller: RebootController,
+    identify_controller: IdentifyController,
+    script_controller: ScriptController,
+    alarm_store: AlarmStore,
 }
 
 impl LinkClient {
@@ -79,6 +89,11 @@ impl LinkClient {
     pub fn with_device_info(config: Config, device_info: DeviceInfo) -> Result<Self, ClientError> {
         device_info.validate()?;
         let deployment_manager = DeploymentManager::from_config(&config);
+        let reboot_controller = RebootController::from_config(config.reboot.as_ref());
+        let identify_controller = IdentifyController::from_config(config.identify.as_ref());
+        let script_controller = ScriptController::from_config(config.scripts.as_ref());
+        let alarm_store = AlarmStore::default();
+        sync_runtime_alarms(&alarm_store, &device_info);
         let console_backend = config
             .console
             .as_ref()
@@ -92,6 +107,10 @@ impl LinkClient {
             deployment_manager,
             health_reporter: Arc::new(SystemHealthReporter),
             console_backend,
+            reboot_controller,
+            identify_controller,
+            script_controller,
+            alarm_store,
         })
     }
 
@@ -107,8 +126,13 @@ impl LinkClient {
 
     pub fn set_device_info(&mut self, device_info: DeviceInfo) -> Result<(), ClientError> {
         device_info.validate()?;
+        sync_runtime_alarms(&self.alarm_store, &device_info);
         self.device_info = device_info;
         Ok(())
+    }
+
+    pub fn alarm_store(&self) -> AlarmStore {
+        self.alarm_store.clone()
     }
 
     pub fn set_deployment_manager(&mut self, deployment_manager: DeploymentManager) {
@@ -149,6 +173,63 @@ impl LinkClient {
         self.console_backend = None;
     }
 
+    pub fn set_rebooter<R>(&mut self, rebooter: R)
+    where
+        R: Rebooter + 'static,
+    {
+        self.reboot_controller.set_rebooter(rebooter);
+    }
+
+    pub fn with_rebooter<R>(mut self, rebooter: R) -> Self
+    where
+        R: Rebooter + 'static,
+    {
+        self.set_rebooter(rebooter);
+        self
+    }
+
+    pub fn disable_reboot(&mut self) {
+        self.reboot_controller.disable();
+    }
+
+    pub fn set_identify_action<A>(&mut self, action: A)
+    where
+        A: IdentifyAction + 'static,
+    {
+        self.identify_controller.set_action(action);
+    }
+
+    pub fn with_identify_action<A>(mut self, action: A) -> Self
+    where
+        A: IdentifyAction + 'static,
+    {
+        self.set_identify_action(action);
+        self
+    }
+
+    pub fn disable_identify(&mut self) {
+        self.identify_controller.disable();
+    }
+
+    pub fn set_script_runner<R>(&mut self, runner: R)
+    where
+        R: ScriptRunner + 'static,
+    {
+        self.script_controller.set_runner(runner);
+    }
+
+    pub fn with_script_runner<R>(mut self, runner: R) -> Self
+    where
+        R: ScriptRunner + 'static,
+    {
+        self.set_script_runner(runner);
+        self
+    }
+
+    pub fn disable_scripts(&mut self) {
+        self.script_controller.disable();
+    }
+
     pub fn serial(&self) -> &str {
         &self.device_info.serial_number
     }
@@ -168,9 +249,25 @@ impl LinkClient {
             deployment_manager: self.deployment_manager.clone(),
             health_reporter: Arc::clone(&self.health_reporter),
             console_backend: self.console_backend.clone(),
+            reboot_controller: self.reboot_controller.clone(),
+            identify_controller: self.identify_controller.clone(),
+            script_controller: self.script_controller.clone(),
+            alarm_store: self.alarm_store.clone(),
         })
         .run(event_tx)
         .await
+    }
+}
+
+fn sync_runtime_alarms(alarm_store: &AlarmStore, device_info: &DeviceInfo) {
+    if device_info
+        .runtime_state
+        .firmware_auto_revert_detected
+        .unwrap_or(false)
+    {
+        alarm_store.set(FIRMWARE_REVERTED_ALARM, "firmware auto revert was detected");
+    } else {
+        alarm_store.clear(FIRMWARE_REVERTED_ALARM);
     }
 }
 
@@ -193,6 +290,7 @@ mod tests {
             serial_number: Some("test-device-001".to_string()),
             fwup_devpath: None,
             fwup_task: None,
+            fwup_public_keys: None,
             firmware: Some(FirmwareMetadata {
                 uuid: "fw-uuid-123".to_string(),
                 version: "1.0.0".to_string(),
@@ -210,6 +308,9 @@ mod tests {
             firmware_auto_revert_detected: None,
             join_params: None,
             console: None,
+            reboot: None,
+            identify: None,
+            scripts: None,
         }
     }
 
@@ -217,6 +318,29 @@ mod tests {
     fn client_creation() {
         let client = LinkClient::new(test_config()).unwrap();
         assert_eq!(client.serial(), "test-device-001");
+    }
+
+    #[test]
+    fn client_alarm_store_sets_gets_lists_and_clears() {
+        let client = LinkClient::new(test_config()).unwrap();
+        let alarms = client.alarm_store();
+
+        alarms.set("link.test", "test alarm");
+
+        assert_eq!(alarms.get("link.test").as_deref(), Some("test alarm"));
+        assert_eq!(
+            alarms.list().get("link.test").map(String::as_str),
+            Some("test alarm")
+        );
+        assert_eq!(
+            client.alarm_store().get("link.test").as_deref(),
+            Some("test alarm")
+        );
+
+        alarms.clear("link.test");
+
+        assert_eq!(alarms.get("link.test"), None);
+        assert!(!alarms.list().contains_key("link.test"));
     }
 
     #[test]
@@ -330,5 +454,37 @@ mod tests {
         assert_eq!(client.serial(), "updated-runtime-device");
         assert_eq!(payload["nerves_fw_uuid"], "updated-fw");
         assert_eq!(payload["nerves_fw_platform"], "rpi5");
+    }
+
+    #[test]
+    fn runtime_device_info_updates_firmware_reverted_alarm() {
+        let mut client = LinkClient::new(test_config()).unwrap();
+        assert!(!client.alarm_store().is_set(FIRMWARE_REVERTED_ALARM));
+
+        let mut info = DeviceInfo {
+            serial_number: "runtime-device-001".to_string(),
+            firmware: FirmwareMetadata {
+                uuid: "runtime-fw".to_string(),
+                version: "2.0.0".to_string(),
+                platform: "x86_64".to_string(),
+                architecture: "x86_64".to_string(),
+                product: "runtime-product".to_string(),
+            },
+            device_api_version: "2.3.0".to_string(),
+            fwup_version: None,
+            console_version: None,
+            runtime_state: DeviceRuntimeState {
+                firmware_auto_revert_detected: Some(true),
+                ..DeviceRuntimeState::default()
+            },
+            extra_join_params: BTreeMap::new(),
+        };
+
+        client.set_device_info(info.clone()).unwrap();
+        assert!(client.alarm_store().is_set(FIRMWARE_REVERTED_ALARM));
+
+        info.runtime_state.firmware_auto_revert_detected = Some(false);
+        client.set_device_info(info).unwrap();
+        assert!(!client.alarm_store().is_set(FIRMWARE_REVERTED_ALARM));
     }
 }

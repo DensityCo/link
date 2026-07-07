@@ -1,2 +1,2 @@
-pub mod mtls;
-pub mod shared_secret;
+pub(crate) mod mtls;
+pub(crate) mod shared_secret;

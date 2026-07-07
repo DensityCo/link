@@ -1,5 +1,7 @@
 use crate::protocol::events::ProtocolEvent;
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -64,7 +66,7 @@ impl Message {
     }
 
     pub fn event(&self) -> Option<ProtocolEvent> {
-        ProtocolEvent::from_str(&self.event)
+        self.event.parse().ok()
     }
 
     pub fn is_reply(&self) -> bool {
@@ -91,6 +93,12 @@ impl RefCounter {
 
     pub fn next(&self) -> String {
         self.next.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+}
+
+impl Default for RefCounter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -148,6 +156,152 @@ impl ChannelBuilder {
             topic: self.topic.clone(),
             event: event.to_string(),
             payload,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DeviceChannel {
+    inner: ChannelBuilder,
+}
+
+impl DeviceChannel {
+    pub const TOPIC: &'static str = "device";
+
+    pub fn new() -> Self {
+        Self {
+            inner: ChannelBuilder::new(Self::TOPIC.to_string()),
+        }
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.inner.topic
+    }
+
+    pub fn join_ref(&self) -> &str {
+        &self.inner.join_ref
+    }
+
+    pub fn join(&self, payload: Value) -> Message {
+        self.inner.join(payload)
+    }
+
+    pub fn heartbeat(&self) -> Message {
+        self.inner.heartbeat()
+    }
+
+    pub fn push(&self, event: ProtocolEvent, payload: Value) -> Message {
+        self.inner.push(event, payload)
+    }
+
+    pub fn rebooting(&self) -> Message {
+        self.push(ProtocolEvent::Rebooting, json!({}))
+    }
+}
+
+impl Default for DeviceChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+pub struct ConsoleChannel {
+    inner: ChannelBuilder,
+}
+
+impl ConsoleChannel {
+    pub const TOPIC: &'static str = "console";
+
+    pub fn new() -> Self {
+        Self {
+            inner: ChannelBuilder::new(Self::TOPIC.to_string()),
+        }
+    }
+
+    pub fn join_ref(&self) -> &str {
+        &self.inner.join_ref
+    }
+
+    pub fn join(&self, payload: Value) -> Message {
+        self.inner.join(payload)
+    }
+
+    pub fn output(&self, data: &str) -> Message {
+        self.inner.push_custom("up", json!({ "data": data }))
+    }
+}
+
+impl Default for ConsoleChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+pub struct ExtensionsChannel {
+    inner: ChannelBuilder,
+}
+
+impl ExtensionsChannel {
+    pub const TOPIC: &'static str = "extensions";
+
+    pub fn new() -> Self {
+        Self {
+            inner: ChannelBuilder::new(Self::TOPIC.to_string()),
+        }
+    }
+
+    pub fn join_ref(&self) -> &str {
+        &self.inner.join_ref
+    }
+
+    pub fn join(&self, payload: Value) -> Message {
+        self.inner.join(payload)
+    }
+
+    pub fn health_attached(&self) -> Message {
+        self.inner.push_custom("health:attached", json!({}))
+    }
+
+    pub fn health_detached(&self) -> Message {
+        self.inner.push_custom("health:detached", json!({}))
+    }
+
+    pub fn health_report<T: Serialize>(&self, report: &T) -> Message {
+        self.inner
+            .push_custom("health:report", json!({ "value": report }))
+    }
+}
+
+impl Default for ExtensionsChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleEvent {
+    Input,
+    WindowSize,
+    Restart,
+    FileDataStart,
+    FileData,
+    FileDataStop,
+}
+
+impl FromStr for ConsoleEvent {
+    type Err = ();
+
+    fn from_str(event: &str) -> Result<Self, Self::Err> {
+        match event {
+            "dn" => Ok(Self::Input),
+            "window_size" => Ok(Self::WindowSize),
+            "restart" => Ok(Self::Restart),
+            "file-data/start" => Ok(Self::FileDataStart),
+            "file-data" => Ok(Self::FileData),
+            "file-data/stop" => Ok(Self::FileDataStop),
+            _ => Err(()),
         }
     }
 }
@@ -245,5 +399,34 @@ mod tests {
         assert!(Message::from_json("{}").is_err());
         assert!(Message::from_json("[1,2,3]").is_err());
         assert!(Message::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn typed_channels_hide_topics_and_events() {
+        let device = DeviceChannel::new();
+        assert_eq!(device.topic(), "device");
+        assert_eq!(device.rebooting().event, "rebooting");
+
+        let console = ConsoleChannel::new();
+        let output = console.output("hello");
+        assert_eq!(output.topic, "console");
+        assert_eq!(output.event, "up");
+        assert_eq!(output.payload["data"], "hello");
+
+        let extensions = ExtensionsChannel::new();
+        let report = extensions.health_report(&json!({"cpu": 12}));
+        assert_eq!(report.topic, "extensions");
+        assert_eq!(report.event, "health:report");
+        assert_eq!(report.payload["value"]["cpu"], 12);
+    }
+
+    #[test]
+    fn console_events_parse_known_wire_names() {
+        assert_eq!("dn".parse::<ConsoleEvent>(), Ok(ConsoleEvent::Input));
+        assert_eq!(
+            "window_size".parse::<ConsoleEvent>(),
+            Ok(ConsoleEvent::WindowSize)
+        );
+        assert!("unknown".parse::<ConsoleEvent>().is_err());
     }
 }

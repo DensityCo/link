@@ -34,6 +34,18 @@ async fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 ClientEvent::RebootRequested => {
                     info!("reboot requested by server");
                 }
+                ClientEvent::IdentifyRequested => {
+                    info!("identify requested by server");
+                }
+                ClientEvent::ScriptRequested(script_ref) => {
+                    info!(script_ref = %script_ref, "script requested by server");
+                }
+                ClientEvent::ScriptCompleted(script_ref) => {
+                    info!(script_ref = %script_ref, "script completed");
+                }
+                ClientEvent::ScriptFailed { script_ref, reason } => {
+                    warn!(script_ref = %script_ref, reason = %reason, "script failed");
+                }
                 ClientEvent::Disconnected(reason) => {
                     warn!(reason = %reason, "disconnected");
                 }

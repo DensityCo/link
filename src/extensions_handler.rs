@@ -1,41 +1,44 @@
+use crate::alarms::AlarmSource;
 use crate::client::{ClientError, ClientEvent};
 use crate::extensions::{
     available_extensions_payload, extension_requested, HealthReporter, HEALTH_EXTENSION_NAME,
 };
-use crate::outbound::OutboundSender;
-use crate::protocol::{ChannelBuilder, Message};
-use serde_json::json;
+use crate::protocol::{ExtensionsChannel, Message};
+use crate::transport::TransportSender;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub(crate) struct ExtensionsHandler {
-    channel: Option<ChannelBuilder>,
+    channel: Option<ExtensionsChannel>,
     health_attached: bool,
     health_reporter: Arc<dyn HealthReporter>,
-    outbound_tx: OutboundSender,
+    alarm_source: Arc<dyn AlarmSource>,
+    transport_tx: TransportSender,
     event_tx: mpsc::Sender<ClientEvent>,
 }
 
 impl ExtensionsHandler {
     pub(crate) fn new(
         health_reporter: Arc<dyn HealthReporter>,
-        outbound_tx: OutboundSender,
+        alarm_source: Arc<dyn AlarmSource>,
+        transport_tx: TransportSender,
         event_tx: mpsc::Sender<ClientEvent>,
     ) -> Self {
         Self {
             channel: None,
             health_attached: false,
             health_reporter,
-            outbound_tx,
+            alarm_source,
+            transport_tx,
             event_tx,
         }
     }
 
     pub(crate) async fn join_available_extensions(&mut self) -> Result<(), ClientError> {
-        let channel = ChannelBuilder::new("extensions".to_string());
+        let channel = ExtensionsChannel::new();
         let join_msg = channel.join(available_extensions_payload());
-        self.outbound_tx.send(join_msg).await?;
+        self.transport_tx.send(join_msg).await?;
         self.channel = Some(channel);
         info!("sent extensions channel join");
         Ok(())
@@ -43,32 +46,7 @@ impl ExtensionsHandler {
 
     pub(crate) async fn handle_message(&mut self, msg: Message) -> Result<(), ClientError> {
         if msg.is_reply() {
-            debug!(
-                ref_id = ?msg.msg_ref,
-                status = ?msg.reply_status(),
-                payload = %msg.payload,
-                "received extensions reply"
-            );
-
-            if let Some(channel) = self.channel.as_ref().cloned() {
-                if msg.msg_ref.as_deref() == Some(channel.join_ref.as_str()) && msg.reply_ok() {
-                    info!("joined extensions channel");
-                    let _ = self.event_tx.send(ClientEvent::ExtensionsJoined).await;
-                    let response = msg.payload.get("response").unwrap_or(&msg.payload);
-                    if extension_requested(response, HEALTH_EXTENSION_NAME) {
-                        let attached = self.attach_health(&channel).await?;
-                        if attached {
-                            self.report_health(&channel).await?;
-                        }
-                    } else {
-                        info!(
-                            "health extension not selected by server; health reports will not be sent"
-                        );
-                    }
-                }
-            }
-
-            return Ok(());
+            return self.handle_reply(&msg).await;
         }
 
         let Some(channel) = self.channel.as_ref().cloned() else {
@@ -105,11 +83,41 @@ impl ExtensionsHandler {
         Ok(())
     }
 
-    async fn attach_health(&mut self, channel: &ChannelBuilder) -> Result<bool, ClientError> {
+    async fn handle_reply(&mut self, msg: &Message) -> Result<(), ClientError> {
+        debug!(
+            ref_id = ?msg.msg_ref,
+            status = ?msg.reply_status(),
+            payload = %msg.payload,
+            "received extensions reply"
+        );
+
+        let Some(channel) = self.channel.as_ref().cloned() else {
+            return Ok(());
+        };
+
+        if msg.msg_ref.as_deref() != Some(channel.join_ref()) || !msg.reply_ok() {
+            return Ok(());
+        }
+
+        info!("joined extensions channel");
+        let _ = self.event_tx.send(ClientEvent::ExtensionsJoined).await;
+        let response = msg.payload.get("response").unwrap_or(&msg.payload);
+
+        if !extension_requested(response, HEALTH_EXTENSION_NAME) {
+            info!("health extension not selected by server; health reports will not be sent");
+            return Ok(());
+        }
+
+        if self.attach_health(&channel).await? {
+            self.report_health(&channel).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn attach_health(&mut self, channel: &ExtensionsChannel) -> Result<bool, ClientError> {
         if !self.health_attached {
-            self.outbound_tx
-                .push_custom(channel, "health:attached", json!({}))
-                .await?;
+            self.transport_tx.send(channel.health_attached()).await?;
             self.health_attached = true;
             info!("attached health extension");
             return Ok(true);
@@ -117,21 +125,20 @@ impl ExtensionsHandler {
         Ok(false)
     }
 
-    async fn detach_health(&mut self, channel: &ChannelBuilder) -> Result<(), ClientError> {
+    async fn detach_health(&mut self, channel: &ExtensionsChannel) -> Result<(), ClientError> {
         if self.health_attached {
-            self.outbound_tx
-                .push_custom(channel, "health:detached", json!({}))
-                .await?;
+            self.transport_tx.send(channel.health_detached()).await?;
             self.health_attached = false;
             info!("detached health extension");
         }
         Ok(())
     }
 
-    async fn report_health(&mut self, channel: &ChannelBuilder) -> Result<(), ClientError> {
-        let report = self.health_reporter.report();
-        self.outbound_tx
-            .push_custom(channel, "health:report", json!({ "value": report }))
+    async fn report_health(&mut self, channel: &ExtensionsChannel) -> Result<(), ClientError> {
+        let mut report = self.health_reporter.report();
+        report.alarms.extend(self.alarm_source.alarms());
+        self.transport_tx
+            .send(channel.health_report(&report))
             .await?;
         let _ = self.event_tx.send(ClientEvent::HealthReported).await;
         info!("reported health");

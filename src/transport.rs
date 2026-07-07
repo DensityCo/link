@@ -1,11 +1,20 @@
 use crate::auth::shared_secret::SharedSecretAuth;
 use crate::config::{AuthConfig, Config};
+use crate::protocol::Message;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
-use tracing::info;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
 use tungstenite::http;
 
-pub type WsStream =
+type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsWrite = SplitSink<WsStream, tungstenite::Message>;
+type WsRead = SplitStream<WsStream>;
+
+const OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -13,9 +22,114 @@ pub enum TransportError {
     Connection(String),
     #[error("auth error: {0}")]
     Auth(String),
+    #[error("transport channel closed")]
+    Closed,
+    #[error("websocket write failed: {0}")]
+    Write(String),
 }
 
-pub async fn connect(config: &Config, serial: &str) -> Result<WsStream, TransportError> {
+pub(crate) struct TransportConnection {
+    read: WsRead,
+    sender: TransportSender,
+    _writer_tasks: JoinSet<()>,
+}
+
+impl TransportConnection {
+    pub(crate) async fn connect(config: &Config, serial: &str) -> Result<Self, TransportError> {
+        let ws_stream = connect_websocket(config, serial).await?;
+        let (write, read) = ws_stream.split();
+        let (sender, outbound_rx) = channel();
+        let mut writer_tasks = JoinSet::new();
+        spawn_writer(&mut writer_tasks, write, outbound_rx);
+
+        Ok(Self {
+            read,
+            sender,
+            _writer_tasks: writer_tasks,
+        })
+    }
+
+    pub(crate) fn sender(&self) -> TransportSender {
+        self.sender.clone()
+    }
+
+    pub(crate) async fn send(&self, message: Message) -> Result<(), TransportError> {
+        self.sender.send(message).await
+    }
+
+    pub(crate) async fn recv(&mut self) -> Result<Option<Message>, TransportError> {
+        loop {
+            match self.read.next().await {
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    debug!(message = %text, "received websocket text");
+                    match Message::from_json(&text) {
+                        Ok(message) => return Ok(Some(message)),
+                        Err(error) => {
+                            warn!(error = %error, "failed to parse message");
+                            continue;
+                        }
+                    }
+                }
+                Some(Ok(tungstenite::Message::Close(_))) | None => return Ok(None),
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => return Err(TransportError::Connection(error.to_string())),
+            }
+        }
+    }
+}
+
+struct OutboundMessage {
+    message: Message,
+    result_tx: oneshot::Sender<Result<(), String>>,
+}
+
+type OutboundReceiver = mpsc::Receiver<OutboundMessage>;
+
+#[derive(Clone)]
+pub(crate) struct TransportSender {
+    tx: mpsc::Sender<OutboundMessage>,
+}
+
+impl TransportSender {
+    pub(crate) async fn send(&self, message: Message) -> Result<(), TransportError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.tx
+            .send(OutboundMessage { message, result_tx })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+
+        result_rx
+            .await
+            .map_err(|_| TransportError::Closed)?
+            .map_err(TransportError::Write)
+    }
+}
+
+fn channel() -> (TransportSender, OutboundReceiver) {
+    let (tx, rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
+    (TransportSender { tx }, rx)
+}
+
+fn spawn_writer(tasks: &mut JoinSet<()>, mut write: WsWrite, mut outbound_rx: OutboundReceiver) {
+    tasks.spawn(async move {
+        while let Some(outbound) = outbound_rx.recv().await {
+            match write
+                .send(tungstenite::Message::Text(outbound.message.to_json()))
+                .await
+            {
+                Ok(()) => {
+                    let _ = outbound.result_tx.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = outbound.result_tx.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn connect_websocket(config: &Config, serial: &str) -> Result<WsStream, TransportError> {
     let url = config.socket_url();
     info!(url = %url, "connecting to server");
 

@@ -68,6 +68,7 @@ pub struct Config {
     pub serial_number: Option<String>,
     pub fwup_devpath: Option<String>,
     pub fwup_task: Option<String>,
+    pub fwup_public_keys: Option<Vec<String>>,
     pub firmware: Option<FirmwareMetadata>,
     pub heartbeat_interval_secs: Option<u64>,
     pub data_dir: Option<PathBuf>,
@@ -79,6 +80,9 @@ pub struct Config {
     pub firmware_auto_revert_detected: Option<bool>,
     pub join_params: Option<BTreeMap<String, Value>>,
     pub console: Option<ConsoleConfig>,
+    pub reboot: Option<RebootConfig>,
+    pub identify: Option<IdentifyConfig>,
+    pub scripts: Option<ScriptsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,21 +126,121 @@ impl ConsoleConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RebootConfig {
+    pub enabled: Option<bool>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub after_firmware_apply: Option<bool>,
+    pub on_server_request: Option<bool>,
+}
+
+impl RebootConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn command(&self) -> &str {
+        self.command.as_deref().unwrap_or("reboot")
+    }
+
+    pub fn args(&self) -> &[String] {
+        self.args.as_deref().unwrap_or(&[])
+    }
+
+    pub fn after_firmware_apply(&self) -> bool {
+        self.after_firmware_apply.unwrap_or(true)
+    }
+
+    pub fn on_server_request(&self) -> bool {
+        self.on_server_request.unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentifyConfig {
+    pub enabled: Option<bool>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+}
+
+impl IdentifyConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn command(&self) -> Option<&str> {
+        self.command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+    }
+
+    pub fn args(&self) -> &[String] {
+        self.args.as_deref().unwrap_or(&[])
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScriptsConfig {
+    pub enabled: Option<bool>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub timeout_secs: Option<u64>,
+}
+
+impl ScriptsConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn command(&self) -> Option<&str> {
+        self.command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+    }
+
+    pub fn args(&self) -> &[String] {
+        self.args.as_deref().unwrap_or(&[])
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(10))
+    }
+}
+
 impl Config {
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
+        content.parse()
     }
 
-    pub fn from_str(content: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(content)?;
-        config.validate()?;
-        Ok(config)
+    pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        content.parse()
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
         if self.host.is_empty() {
             return Err(ConfigError::Missing("host"));
+        }
+        if self.identify.as_ref().is_some_and(IdentifyConfig::enabled)
+            && self
+                .identify
+                .as_ref()
+                .and_then(IdentifyConfig::command)
+                .is_none()
+        {
+            return Err(ConfigError::Missing("identify.command"));
+        }
+        if self.scripts.as_ref().is_some_and(ScriptsConfig::enabled)
+            && self
+                .scripts
+                .as_ref()
+                .and_then(ScriptsConfig::command)
+                .is_none()
+        {
+            return Err(ConfigError::Missing("scripts.command"));
         }
         Ok(())
     }
@@ -145,7 +249,19 @@ impl Config {
         let host = self.normalized_host();
         format!("{}{}?vsn=2.0.0", host, self.auth.endpoint_path())
     }
+}
 
+impl std::str::FromStr for Config {
+    type Err = ConfigError;
+
+    fn from_str(content: &str) -> Result<Self, Self::Err> {
+        let config: Config = toml::from_str(content)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl Config {
     fn normalized_host(&self) -> String {
         let host = self.host.trim().trim_end_matches('/');
         if let Some(rest) = host.strip_prefix("https://") {
@@ -171,6 +287,10 @@ impl Config {
         self.fwup_task.as_deref().unwrap_or("upgrade")
     }
 
+    pub fn fwup_public_keys(&self) -> &[String] {
+        self.fwup_public_keys.as_deref().unwrap_or(&[])
+    }
+
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir
             .clone()
@@ -191,6 +311,18 @@ impl Config {
 
     pub fn console_enabled(&self) -> bool {
         self.console.as_ref().is_some_and(ConsoleConfig::enabled)
+    }
+
+    pub fn reboot_enabled(&self) -> bool {
+        self.reboot.as_ref().is_some_and(RebootConfig::enabled)
+    }
+
+    pub fn identify_enabled(&self) -> bool {
+        self.identify.as_ref().is_some_and(IdentifyConfig::enabled)
+    }
+
+    pub fn scripts_enabled(&self) -> bool {
+        self.scripts.as_ref().is_some_and(ScriptsConfig::enabled)
     }
 
     pub fn fwup_version(&self) -> Option<&str> {
@@ -250,7 +382,7 @@ platform = "rpi4"
 architecture = "arm"
 product = "my-product"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert_eq!(config.host, "https://fleet.fabric.density.ai/");
         assert_eq!(
             config.socket_url(),
@@ -278,7 +410,7 @@ platform = "rpi4"
 architecture = "arm"
 product = "my-product"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert_eq!(
             config.socket_url(),
             "wss://fleet.fabric.density.ai/device-socket/websocket?vsn=2.0.0"
@@ -317,7 +449,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert_eq!(
             config.socket_url(),
             "ws://localhost:4000/device-socket/websocket?vsn=2.0.0"
@@ -342,7 +474,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        assert!(Config::from_str(toml).is_err());
+        assert!(Config::from_toml(toml).is_err());
     }
 
     #[test]
@@ -362,7 +494,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert!(config.serial_number.is_none());
     }
 
@@ -384,11 +516,42 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert_eq!(config.heartbeat_interval_secs(), 30);
         assert_eq!(config.fwup_devpath(), "/dev/mmcblk0");
         assert_eq!(config.fwup_task(), "upgrade");
+        assert!(config.fwup_public_keys().is_empty());
         assert_eq!(config.device_api_version(), "2.3.0");
+        assert!(!config.reboot_enabled());
+        assert!(!config.identify_enabled());
+        assert!(!config.scripts_enabled());
+    }
+
+    #[test]
+    fn parses_fwup_public_keys() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+fwup_public_keys = ["key-1", "key-2"]
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+
+        assert_eq!(
+            config.fwup_public_keys(),
+            &["key-1".to_string(), "key-2".to_string()]
+        );
     }
 
     #[test]
@@ -409,7 +572,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         assert_eq!(
             config.socket_url(),
             "ws://localhost:4000/device-socket/websocket?vsn=2.0.0"
@@ -438,7 +601,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         let info = config.device_info().unwrap();
         let payload = info.join_payload();
 
@@ -465,7 +628,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         let err = config.device_info().unwrap_err();
 
         assert!(matches!(err, ConfigError::Missing("serial_number")));
@@ -498,7 +661,7 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
         let console = config.console.as_ref().unwrap();
 
         assert!(config.console_enabled());
@@ -535,9 +698,160 @@ platform = "p"
 architecture = "a"
 product = "pr"
 "#;
-        let config = Config::from_str(toml).unwrap();
+        let config = Config::from_toml(toml).unwrap();
 
         assert!(!config.console_enabled());
         assert_eq!(config.console_version(), None);
+    }
+
+    #[test]
+    fn reboot_config_is_opt_in() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[reboot]
+enabled = true
+command = "/sbin/reboot"
+args = ["--force"]
+after_firmware_apply = false
+on_server_request = true
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        let reboot = config.reboot.as_ref().unwrap();
+
+        assert!(config.reboot_enabled());
+        assert_eq!(reboot.command(), "/sbin/reboot");
+        assert_eq!(reboot.args(), &["--force".to_string()]);
+        assert!(!reboot.after_firmware_apply());
+        assert!(reboot.on_server_request());
+    }
+
+    #[test]
+    fn identify_config_is_opt_in() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[identify]
+enabled = true
+command = "/usr/bin/identify-device"
+args = ["--blink"]
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        let identify = config.identify.as_ref().unwrap();
+
+        assert!(config.identify_enabled());
+        assert_eq!(identify.command(), Some("/usr/bin/identify-device"));
+        assert_eq!(identify.args(), &["--blink".to_string()]);
+    }
+
+    #[test]
+    fn enabled_identify_config_requires_command() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[identify]
+enabled = true
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let err = Config::from_toml(toml).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Missing("identify.command")));
+    }
+
+    #[test]
+    fn scripts_config_is_opt_in() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[scripts]
+enabled = true
+command = "/bin/sh"
+args = ["-s"]
+timeout_secs = 20
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        let scripts = config.scripts.as_ref().unwrap();
+
+        assert!(config.scripts_enabled());
+        assert_eq!(scripts.command(), Some("/bin/sh"));
+        assert_eq!(scripts.args(), &["-s".to_string()]);
+        assert_eq!(scripts.timeout(), std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn enabled_scripts_config_requires_command() {
+        let toml = r#"
+host = "example.com"
+serial_number = "dev-1"
+
+[auth]
+type = "shared_secret"
+key = "k"
+secret = "s"
+
+[scripts]
+enabled = true
+
+[firmware]
+uuid = "u"
+version = "v"
+platform = "p"
+architecture = "a"
+product = "pr"
+"#;
+        let err = Config::from_toml(toml).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Missing("scripts.command")));
     }
 }

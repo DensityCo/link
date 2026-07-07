@@ -2,9 +2,8 @@ use crate::client::{ClientError, ClientEvent};
 use crate::console::{
     ConsoleBackend, ConsoleError, ConsoleFileReceiver, ConsoleOutput, ConsoleSession,
 };
-use crate::outbound::OutboundSender;
-use crate::protocol::ChannelBuilder;
-use serde_json::json;
+use crate::protocol::{ConsoleChannel, ConsoleEvent, Message};
+use crate::transport::TransportSender;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -12,24 +11,24 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub(crate) struct ConsoleHandler {
-    channel: Option<ChannelBuilder>,
+    channel: Option<ConsoleChannel>,
     backend: Option<Arc<dyn ConsoleBackend>>,
     session: Option<Box<dyn ConsoleSession>>,
     deadline: Option<Instant>,
     file_receiver: ConsoleFileReceiver,
-    output_tx: mpsc::UnboundedSender<ConsoleOutput>,
-    outbound_tx: OutboundSender,
+    output_tx: mpsc::Sender<ConsoleOutput>,
+    transport_tx: TransportSender,
     event_tx: mpsc::Sender<ClientEvent>,
     timeout_secs: u64,
 }
 
 impl ConsoleHandler {
     pub(crate) fn new(
-        channel: Option<ChannelBuilder>,
+        channel: Option<ConsoleChannel>,
         backend: Option<Arc<dyn ConsoleBackend>>,
         data_dir: PathBuf,
-        output_tx: mpsc::UnboundedSender<ConsoleOutput>,
-        outbound_tx: OutboundSender,
+        output_tx: mpsc::Sender<ConsoleOutput>,
+        transport_tx: TransportSender,
         event_tx: mpsc::Sender<ClientEvent>,
         timeout_secs: u64,
     ) -> Self {
@@ -40,41 +39,19 @@ impl ConsoleHandler {
             deadline: None,
             file_receiver: ConsoleFileReceiver::new(data_dir),
             output_tx,
-            outbound_tx,
+            transport_tx,
             event_tx,
             timeout_secs,
         }
     }
 
-    pub(crate) fn timeout_at(&self) -> Instant {
+    pub(crate) fn timeout_at(&self) -> Option<Instant> {
         self.deadline
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60))
     }
 
-    pub(crate) fn session_active(&self) -> bool {
-        self.session.is_some()
-    }
-
-    pub(crate) async fn handle_message(
-        &mut self,
-        msg: crate::protocol::Message,
-    ) -> Result<(), ClientError> {
+    pub(crate) async fn handle_message(&mut self, msg: Message) -> Result<(), ClientError> {
         if msg.is_reply() {
-            debug!(
-                ref_id = ?msg.msg_ref,
-                status = ?msg.reply_status(),
-                payload = %msg.payload,
-                "received console reply"
-            );
-
-            if let Some(channel) = self.channel.as_ref() {
-                if msg.msg_ref.as_deref() == Some(channel.join_ref.as_str()) && msg.reply_ok() {
-                    info!("joined console channel");
-                    let _ = self.event_tx.send(ClientEvent::ConsoleJoined).await;
-                }
-            }
-
-            return Ok(());
+            return self.handle_reply(&msg).await;
         }
 
         let Some(channel) = self.channel.as_ref().cloned() else {
@@ -82,36 +59,38 @@ impl ConsoleHandler {
             return Ok(());
         };
 
-        match msg.event.as_str() {
-            "dn" => {
+        match msg.event.parse() {
+            Ok(ConsoleEvent::Input) => {
                 self.ensure_session().await?;
 
-                if let Some(session) = self.session.as_mut() {
-                    let data = msg
-                        .payload
-                        .get("data")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default();
-                    session.write_input(data)?;
-                    self.reset_deadline();
-                }
+                let Some(session) = self.session.as_mut() else {
+                    return Ok(());
+                };
+                let data = msg
+                    .payload
+                    .get("data")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                session.write_input(data)?;
+                self.reset_deadline();
             }
-            "window_size" => {
+            Ok(ConsoleEvent::WindowSize) => {
                 self.ensure_session().await?;
 
-                if let Some(session) = self.session.as_mut() {
-                    let (rows, cols) = console_size_from_payload(&msg.payload);
-                    session.resize(rows, cols)?;
-                    self.reset_deadline();
-                }
+                let Some(session) = self.session.as_mut() else {
+                    return Ok(());
+                };
+                let (rows, cols) = console_size_from_payload(&msg.payload);
+                session.resize(rows, cols)?;
+                self.reset_deadline();
             }
-            "restart" => {
+            Ok(ConsoleEvent::Restart) => {
                 self.stop_session().await?;
                 self.push_text(&channel, "\r*** Restarting shell ***\r")
                     .await?;
                 self.ensure_session().await?;
             }
-            "file-data/start" => {
+            Ok(ConsoleEvent::FileDataStart) => {
                 let result = msg
                     .payload
                     .get("filename")
@@ -131,7 +110,7 @@ impl ConsoleHandler {
                     }
                 }
             }
-            "file-data" => {
+            Ok(ConsoleEvent::FileData) => {
                 let result = msg
                     .payload
                     .get("data")
@@ -148,13 +127,13 @@ impl ConsoleHandler {
                     .await?;
                 }
             }
-            "file-data/stop" => {
+            Ok(ConsoleEvent::FileDataStop) => {
                 if let Some(path) = self.file_receiver.finish() {
                     info!(path = %path.display(), "finished console file upload");
                 }
             }
-            other => {
-                debug!(event = other, "unhandled console event");
+            Err(()) => {
+                debug!(event = %msg.event, "unhandled console event");
             }
         }
 
@@ -183,6 +162,26 @@ impl ConsoleHandler {
         }
 
         self.stop_session().await
+    }
+
+    async fn handle_reply(&mut self, msg: &Message) -> Result<(), ClientError> {
+        debug!(
+            ref_id = ?msg.msg_ref,
+            status = ?msg.reply_status(),
+            payload = %msg.payload,
+            "received console reply"
+        );
+
+        let joined = self.channel.as_ref().is_some_and(|channel| {
+            msg.msg_ref.as_deref() == Some(channel.join_ref()) && msg.reply_ok()
+        });
+
+        if joined {
+            info!("joined console channel");
+            let _ = self.event_tx.send(ClientEvent::ConsoleJoined).await;
+        }
+
+        Ok(())
     }
 
     async fn ensure_session(&mut self) -> Result<(), ClientError> {
@@ -215,14 +214,12 @@ impl ConsoleHandler {
         Ok(())
     }
 
-    async fn push_text(&mut self, channel: &ChannelBuilder, data: &str) -> Result<(), ClientError> {
+    async fn push_text(&mut self, channel: &ConsoleChannel, data: &str) -> Result<(), ClientError> {
         if data.is_empty() {
             return Ok(());
         }
 
-        self.outbound_tx
-            .push_custom(channel, "up", json!({ "data": data }))
-            .await?;
+        self.transport_tx.send(channel.output(data)).await?;
         Ok(())
     }
 

@@ -39,10 +39,13 @@ impl DeploymentManager {
         let options = DeploymentOptions {
             data_dir: config.data_dir(),
         };
-        let installer = Arc::new(FwupInstaller::new(
-            config.fwup_devpath().to_string(),
-            config.fwup_task().to_string(),
-        ));
+        let installer = Arc::new(
+            FwupInstaller::new(
+                config.fwup_devpath().to_string(),
+                config.fwup_task().to_string(),
+            )
+            .with_public_keys(config.fwup_public_keys().to_vec()),
+        );
 
         Self::new(options, installer)
     }
@@ -73,18 +76,4 @@ impl DeploymentManager {
 
         Ok(firmware_path)
     }
-}
-
-pub async fn deploy_firmware<F>(
-    deployment: Deployment,
-    options: DeploymentOptions,
-    installer: Arc<dyn FirmwareInstaller>,
-    on_event: F,
-) -> Result<PathBuf, DeploymentError>
-where
-    F: FnMut(DeploymentEvent) + Send + 'static,
-{
-    DeploymentManager::new(options, installer)
-        .run(deployment, on_event)
-        .await
 }

@@ -38,6 +38,7 @@ Configuration is a TOML file. See `examples/` for complete samples.
 | `serial_number` | * | | Static device serial number |
 | `fwup_devpath` | no | `/dev/mmcblk0` | Block device for fwup to write to |
 | `fwup_task` | no | `upgrade` | fwup task name |
+| `fwup_public_keys` | no | `[]` | Firmware signing public keys passed to `fwup --public-key` |
 | `heartbeat_interval_secs` | no | `30` | Seconds between heartbeats |
 | `data_dir` | no | `/tmp/link` | Directory for temporary firmware downloads |
 | `device_api_version` | no | `2.3.0` | API version reported to the server |
@@ -93,6 +94,48 @@ The default daemon backend starts the configured command in a PTY, forwards serv
 
 The `key` is the identifier registered with Fabric Fleet. The `secret` is the corresponding shared secret. These are used to generate HMAC-signed headers on each connection.
 
+### Identify
+
+Device identification is disabled by default. Enable it when the target should run a command after the server sends an `identify` event, for example to blink LEDs or show a local indicator:
+
+```toml
+[identify]
+enabled = true
+command = "/usr/bin/identify-device"
+args = ["--blink"]
+```
+
+Library callers can provide their own action with `LinkClient::set_identify_action`. Unlike reboot, the `identify` protocol event does not send a status message back to the server.
+
+### Support Scripts
+
+Support scripts are disabled by default. Enabling them allows the server to send `scripts/run` requests, so treat this as remote code execution and enable it only for devices and products where that is intended.
+
+```toml
+[scripts]
+enabled = true
+command = "/bin/sh"
+args = ["-s"]
+timeout_secs = 10
+```
+
+The default daemon command runner passes the script text to the configured command on stdin, captures stdout and stderr, enforces the timeout, and reports the result back on the device channel as `scripts/run`. Library callers can provide their own implementation with `LinkClient::set_script_runner`, which keeps the core library independent of Elixir, Nerves, or any particular script language.
+
+### Reboot
+
+Reboot execution is disabled by default so the same library can be used safely on development hosts and non-Nerves systems. Enable it in daemon config when the target should reboot after a successful firmware apply or when the server sends a reboot command:
+
+```toml
+[reboot]
+enabled = true
+command = "reboot"
+args = []
+after_firmware_apply = true
+on_server_request = true
+```
+
+When reboot is enabled, the daemon sends the protocol `rebooting` status before executing the command. Library callers can provide their own reboot implementation with `LinkClient::set_rebooter`.
+
 #### mTLS
 
 ```toml
@@ -117,7 +160,15 @@ Applications embedding the library can omit `serial_number` from config and pass
 
 ### Firmware installer
 
-The default daemon path builds a `FwupInstaller` from `fwup_devpath` and `fwup_task`. Library callers can provide their own installer by constructing a `DeploymentManager` with a custom `FirmwareInstaller` and setting it on the client:
+The default daemon path builds a `FwupInstaller` from `fwup_devpath`, `fwup_task`, and `fwup_public_keys`. Configure at least one `fwup_public_keys` entry to have `fwup` verify firmware signatures before applying updates:
+
+```toml
+fwup_public_keys = [
+  "REPLACE_WITH_FWUP_PUBLIC_KEY"
+]
+```
+
+Library callers can provide their own installer by constructing a `DeploymentManager` with a custom `FirmwareInstaller` and setting it on the client:
 
 ```rust
 let deployment_manager = DeploymentManager::with_installer(options, installer);
@@ -134,6 +185,29 @@ The default `SystemHealthReporter` reports platform-agnostic host metrics using 
 client.set_health_reporter(reporter);
 ```
 
+### Alarms
+
+Alarms are reported through the health extension as `alarms` in the `health:report` payload. They are local runtime state and are intentionally Nerves-agnostic.
+
+Library callers can set and clear alarms through the client's alarm store:
+
+```rust
+let alarms = client.alarm_store();
+
+alarms.set("my_app.sensor_unavailable", "sensor process is not responding");
+let alarm = alarms.get("my_app.sensor_unavailable");
+let active_alarms = alarms.list();
+alarms.clear("my_app.sensor_unavailable");
+```
+
+The client also manages these internal alarms:
+
+| Alarm | Meaning |
+|-------|---------|
+| `link.disconnected` | The socket is disconnected or the last connection attempt failed |
+| `link.update_in_progress` | A firmware update is currently running |
+| `link.firmware_reverted` | Runtime device state reported firmware auto-revert detection |
+
 ## Behavior
 
 On startup, `link`:
@@ -145,10 +219,14 @@ On startup, `link`:
 5. Joins the extensions channel when requested and reports health if the server selects the `health` extension
 6. Joins the console channel when `[console].enabled = true`
 7. Sends heartbeats every 30 seconds
-8. Listens for wire-level `update` events containing a firmware URL
-9. Downloads the firmware to `data_dir` as `firmware-{uuid}.fw.tmp`, then renames it to `firmware-{uuid}.fw`
-10. Applies it through the configured installer
-11. Reports staged progress and completion to the server
+8. Runs the configured identify action when the server sends `identify`
+9. Runs support scripts when `[scripts].enabled = true` and the server sends `scripts/run`
+10. Includes current alarms in health reports
+11. Listens for wire-level `update` events containing a firmware URL
+12. Downloads the firmware to `data_dir` as `firmware-{uuid}.fw.tmp`, then renames it to `firmware-{uuid}.fw`
+13. Applies it through the configured installer
+14. Reports staged progress and completion to the server
+15. Sends `rebooting` and executes the configured reboot hook when reboot is enabled
 
 On disconnect, `LinkRunner` reconnects with exponential backoff (1s to 60s with jitter).
 
@@ -156,3 +234,6 @@ On disconnect, `LinkRunner` reconnects with exponential backoff (1s to 60s with 
 
 - The default daemon installer requires `fwup` on `PATH`
 - The default console backend requires the configured shell command on `PATH`
+- Identify support requires enabling `[identify]` and providing a command available on `PATH`
+- Reboot support requires enabling `[reboot]` and providing a command available on `PATH`
+- Support script execution requires enabling `[scripts]` and providing a command available on `PATH`
