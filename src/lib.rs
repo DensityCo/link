@@ -1,26 +1,48 @@
-pub mod auth;
-pub mod client;
-mod client_deployment;
-pub mod config;
-pub mod console;
-pub mod deployment;
-pub mod device;
-pub mod extensions;
-pub mod protocol;
-pub mod runner;
+mod alarms;
+mod auth;
+mod client;
+mod config;
+mod connection;
+mod console;
+mod console_handler;
+mod deployment;
+mod deployment_handler;
+mod device;
+mod device_handler;
+mod device_reporter;
+mod extensions;
+mod extensions_handler;
+mod identify;
+mod phoenix_session;
+mod protocol;
+mod reboot;
+mod runner;
+mod scripts;
+mod session_state;
 mod tls;
-pub mod transport;
+mod transport;
 
-pub use client::{ClientEvent, LinkClient};
-pub use config::{AuthConfig, Config, ConfigError};
-pub use console::{ConsoleBackend, ConsoleOutput, ConsoleSession, PtyConsoleBackend};
+pub use alarms::{
+    AlarmSource, AlarmStore, DISCONNECTED_ALARM, FIRMWARE_REVERTED_ALARM, UPDATE_IN_PROGRESS_ALARM,
+};
+pub use client::{ClientError, ClientEvent, LinkClient};
+pub use config::{
+    AuthConfig, Config, ConfigError, ConsoleConfig, IdentifyConfig, RebootConfig, ScriptsConfig,
+};
+pub use console::{
+    ConsoleBackend, ConsoleError, ConsoleOptions, ConsoleOutput, ConsoleSession, PtyConsoleBackend,
+};
 pub use deployment::{
-    Deployment, DeploymentError, DeploymentManager, DeploymentOptions, FirmwareInstaller,
-    FirmwareMeta, FwupInstaller,
+    Deployment, DeploymentError, DeploymentEvent, DeploymentManager, DeploymentOptions,
+    FirmwareInstaller, FirmwareMeta, FwupInstaller,
 };
 pub use device::{
     DeviceInfo, DeviceInfoError, DeviceInfoProvider, DeviceRuntimeState, FirmwareMetadata,
     StaticDeviceInfoProvider,
 };
-pub use extensions::{HealthReport, HealthReporter, SystemHealthReporter};
+pub use extensions::{HealthCheck, HealthReport, HealthReporter, SystemHealthReporter};
+pub use identify::{CommandIdentifyAction, IdentifyAction, IdentifyError};
+pub use reboot::{CommandRebooter, RebootError, RebootReason, Rebooter};
 pub use runner::{backoff_delay, LinkRunner, RunnerOptions};
+pub use scripts::{CommandScriptRunner, ScriptError, ScriptOutput, ScriptRequest, ScriptRunner};
+pub use transport::TransportError;

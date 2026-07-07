@@ -22,13 +22,6 @@ pub enum UpdateStatus {
         downloader_network_interface: Option<String>,
     },
     Completed,
-    Ignored {
-        reason: String,
-    },
-    Rescheduled {
-        delay_for: u64,
-        reason: Option<String>,
-    },
     Failed {
         reason: String,
     },
@@ -50,23 +43,6 @@ impl UpdateStatus {
                 downloader_network_interface: None,
             } => json!({"status": "started"}),
             UpdateStatus::Completed => json!({"status": "completed"}),
-            UpdateStatus::Ignored { reason } => {
-                json!({"status": "ignored", "reason": reason})
-            }
-            UpdateStatus::Rescheduled {
-                delay_for,
-                reason: Some(reason),
-            } => {
-                json!({
-                    "status": "rescheduled",
-                    "delay_for": delay_for,
-                    "reason": reason,
-                })
-            }
-            UpdateStatus::Rescheduled {
-                delay_for,
-                reason: None,
-            } => json!({"status": "rescheduled", "delay_for": delay_for}),
             UpdateStatus::Failed { reason } => {
                 json!({"status": "failed", "reason": reason})
             }
@@ -94,14 +70,6 @@ mod tests {
             }
             .payload()["reason"],
             "nope"
-        );
-        assert_eq!(
-            UpdateStatus::Rescheduled {
-                delay_for: 10,
-                reason: None
-            }
-            .payload()["delay_for"],
-            10
         );
     }
 

@@ -1,13 +1,13 @@
-pub mod download;
-pub mod fwup;
-pub mod installer;
-pub mod runner;
-pub mod types;
+mod download;
+mod fwup;
+mod installer;
+mod runner;
+mod types;
 
 pub use download::{download_firmware, progress_percent};
 pub use fwup::apply_firmware;
 pub use installer::{FirmwareInstaller, FwupInstaller};
-pub use runner::{deploy_firmware, DeploymentEvent, DeploymentManager, DeploymentOptions};
+pub use runner::{DeploymentEvent, DeploymentManager, DeploymentOptions};
 pub use types::{Deployment, FirmwareMeta};
 
 use thiserror::Error;

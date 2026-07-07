@@ -129,7 +129,7 @@ impl SharedSecretAuth {
             .map_err(|e| SharedSecretError::Hmac(e.to_string()))?;
         mac.update(signing_input.as_bytes());
         let hmac_result = mac.finalize().into_bytes();
-        let encoded_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hmac_result);
+        let encoded_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hmac_result);
 
         Ok(format!("{}.{}.{}", PROTOC_HS256, payload, encoded_sig))
     }

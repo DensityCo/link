@@ -8,6 +8,8 @@ pub enum ProtocolEvent {
     ExtensionsGet,
     Update,
     Reboot,
+    Identify,
+    ScriptsRun,
     Rebooting,
     StatusUpdate,
     FwupProgress,
@@ -24,26 +26,34 @@ impl ProtocolEvent {
             ProtocolEvent::ExtensionsGet => "extensions:get",
             ProtocolEvent::Update => "update",
             ProtocolEvent::Reboot => "reboot",
+            ProtocolEvent::Identify => "identify",
+            ProtocolEvent::ScriptsRun => "scripts/run",
             ProtocolEvent::Rebooting => "rebooting",
             ProtocolEvent::StatusUpdate => "status_update",
             ProtocolEvent::FwupProgress => "fwup_progress",
         }
     }
+}
 
-    pub fn from_str(event: &str) -> Option<Self> {
+impl std::str::FromStr for ProtocolEvent {
+    type Err = ();
+
+    fn from_str(event: &str) -> Result<Self, Self::Err> {
         match event {
-            "phx_join" => Some(ProtocolEvent::PhxJoin),
-            "phx_reply" => Some(ProtocolEvent::PhxReply),
-            "phx_error" => Some(ProtocolEvent::PhxError),
-            "phx_close" => Some(ProtocolEvent::PhxClose),
-            "heartbeat" => Some(ProtocolEvent::Heartbeat),
-            "extensions:get" => Some(ProtocolEvent::ExtensionsGet),
-            "update" => Some(ProtocolEvent::Update),
-            "reboot" => Some(ProtocolEvent::Reboot),
-            "rebooting" => Some(ProtocolEvent::Rebooting),
-            "status_update" => Some(ProtocolEvent::StatusUpdate),
-            "fwup_progress" => Some(ProtocolEvent::FwupProgress),
-            _ => None,
+            "phx_join" => Ok(ProtocolEvent::PhxJoin),
+            "phx_reply" => Ok(ProtocolEvent::PhxReply),
+            "phx_error" => Ok(ProtocolEvent::PhxError),
+            "phx_close" => Ok(ProtocolEvent::PhxClose),
+            "heartbeat" => Ok(ProtocolEvent::Heartbeat),
+            "extensions:get" => Ok(ProtocolEvent::ExtensionsGet),
+            "update" => Ok(ProtocolEvent::Update),
+            "reboot" => Ok(ProtocolEvent::Reboot),
+            "identify" => Ok(ProtocolEvent::Identify),
+            "scripts/run" => Ok(ProtocolEvent::ScriptsRun),
+            "rebooting" => Ok(ProtocolEvent::Rebooting),
+            "status_update" => Ok(ProtocolEvent::StatusUpdate),
+            "fwup_progress" => Ok(ProtocolEvent::FwupProgress),
+            _ => Err(()),
         }
     }
 }
@@ -55,10 +65,14 @@ mod tests {
     #[test]
     fn maps_known_events() {
         assert_eq!(
-            ProtocolEvent::from_str("status_update"),
-            Some(ProtocolEvent::StatusUpdate)
+            "status_update".parse::<ProtocolEvent>(),
+            Ok(ProtocolEvent::StatusUpdate)
+        );
+        assert_eq!(
+            "scripts/run".parse::<ProtocolEvent>(),
+            Ok(ProtocolEvent::ScriptsRun)
         );
         assert_eq!(ProtocolEvent::FwupProgress.as_str(), "fwup_progress");
-        assert_eq!(ProtocolEvent::from_str("custom"), None);
+        assert!("custom".parse::<ProtocolEvent>().is_err());
     }
 }
