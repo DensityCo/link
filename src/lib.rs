@@ -27,7 +27,8 @@ pub use alarms::{
 };
 pub use client::{ClientError, ClientEvent, LinkClient};
 pub use config::{
-    AuthConfig, Config, ConfigError, ConsoleConfig, IdentifyConfig, RebootConfig, ScriptsConfig,
+    AuthConfig, Config, ConfigError, ConsoleConfig, DeviceInfoSourceConfig, IdentifyConfig,
+    RebootConfig, ScriptsConfig,
 };
 pub use console::{
     ConsoleBackend, ConsoleError, ConsoleOptions, ConsoleOutput, ConsoleSession, PtyConsoleBackend,
@@ -37,8 +38,9 @@ pub use deployment::{
     FirmwareInstaller, FirmwareMeta, FwupInstaller,
 };
 pub use device::{
-    DeviceInfo, DeviceInfoError, DeviceInfoProvider, DeviceRuntimeState, FirmwareMetadata,
-    StaticDeviceInfoProvider,
+    CommandDeviceInfoProvider, DeviceInfo, DeviceInfoError, DeviceInfoProvider,
+    DeviceInfoSourceError, DeviceInfoSourceProvider, DeviceRuntimeState, FirmwareMetadata,
+    JsonFileDeviceInfoProvider, StaticDeviceInfoProvider, DEFAULT_DEVICE_INFO_COMMAND_TIMEOUT_SECS,
 };
 pub use extensions::{HealthCheck, HealthReport, HealthReporter, SystemHealthReporter};
 pub use identify::{CommandIdentifyAction, IdentifyAction, IdentifyError};

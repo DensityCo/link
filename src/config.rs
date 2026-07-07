@@ -1,9 +1,13 @@
-use crate::device::{DeviceInfo, DeviceRuntimeState, FirmwareMetadata};
+use crate::device::{
+    CommandDeviceInfoProvider, DeviceInfo, DeviceInfoSourceProvider, DeviceRuntimeState,
+    FirmwareMetadata, JsonFileDeviceInfoProvider, DEFAULT_DEVICE_INFO_COMMAND_TIMEOUT_SECS,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,6 +69,7 @@ impl AuthConfig {
 pub struct Config {
     pub host: String,
     pub auth: AuthConfig,
+    pub device_info: Option<DeviceInfoSourceConfig>,
     pub serial_number: Option<String>,
     pub fwup_devpath: Option<String>,
     pub fwup_task: Option<String>,
@@ -83,6 +88,56 @@ pub struct Config {
     pub reboot: Option<RebootConfig>,
     pub identify: Option<IdentifyConfig>,
     pub scripts: Option<ScriptsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum DeviceInfoSourceConfig {
+    JsonFile {
+        path: PathBuf,
+    },
+    Command {
+        command: String,
+        args: Option<Vec<String>>,
+        timeout_secs: Option<u64>,
+    },
+}
+
+impl DeviceInfoSourceConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            DeviceInfoSourceConfig::JsonFile { .. } => Ok(()),
+            DeviceInfoSourceConfig::Command { command, .. } => {
+                if command.trim().is_empty() {
+                    Err(ConfigError::Missing("device_info.command"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub fn provider(&self) -> DeviceInfoSourceProvider {
+        match self {
+            DeviceInfoSourceConfig::JsonFile { path } => {
+                DeviceInfoSourceProvider::JsonFile(JsonFileDeviceInfoProvider::new(path.clone()))
+            }
+            DeviceInfoSourceConfig::Command {
+                command,
+                args,
+                timeout_secs,
+            } => {
+                let timeout_secs = timeout_secs
+                    .unwrap_or(DEFAULT_DEVICE_INFO_COMMAND_TIMEOUT_SECS)
+                    .max(1);
+                DeviceInfoSourceProvider::Command(CommandDeviceInfoProvider::with_args_and_timeout(
+                    command.clone(),
+                    args.clone().unwrap_or_default(),
+                    Duration::from_secs(timeout_secs),
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +279,9 @@ impl Config {
         if self.host.is_empty() {
             return Err(ConfigError::Missing("host"));
         }
+        if let Some(device_info) = &self.device_info {
+            device_info.validate()?;
+        }
         if self.identify.as_ref().is_some_and(IdentifyConfig::enabled)
             && self
                 .identify
@@ -329,6 +387,12 @@ impl Config {
         self.fwup_version.as_deref()
     }
 
+    pub fn device_info_provider(&self) -> Option<DeviceInfoSourceProvider> {
+        self.device_info
+            .as_ref()
+            .map(DeviceInfoSourceConfig::provider)
+    }
+
     pub fn device_info(&self) -> Result<DeviceInfo, ConfigError> {
         let serial_number = self
             .serial_number
@@ -416,6 +480,89 @@ product = "my-product"
             "wss://fleet.fabric.density.ai/device-socket/websocket?vsn=2.0.0"
         );
         assert!(matches!(config.auth, AuthConfig::SharedSecret { .. }));
+    }
+
+    #[test]
+    fn parse_json_file_device_info_source() {
+        let toml = r#"
+host = "https://fleet.fabric.density.ai/"
+
+[auth]
+type = "shared_secret"
+key = "my-key"
+secret = "super-secret"
+
+[device_info]
+source = "json_file"
+path = "/run/link/device-info.json"
+"#;
+        let config = Config::from_toml(toml).unwrap();
+
+        assert!(matches!(
+            config.device_info.as_ref().unwrap(),
+            DeviceInfoSourceConfig::JsonFile { path }
+                if path == &PathBuf::from("/run/link/device-info.json")
+        ));
+        assert!(matches!(
+            config.device_info_provider().unwrap(),
+            crate::device::DeviceInfoSourceProvider::JsonFile(_)
+        ));
+    }
+
+    #[test]
+    fn parse_command_device_info_source() {
+        let toml = r#"
+host = "https://fleet.fabric.density.ai/"
+
+[auth]
+type = "shared_secret"
+key = "my-key"
+secret = "super-secret"
+
+[device_info]
+source = "command"
+command = "/usr/bin/link-device-info"
+args = ["--json"]
+timeout_secs = 7
+"#;
+        let config = Config::from_toml(toml).unwrap();
+
+        assert!(matches!(
+            config.device_info.as_ref().unwrap(),
+            DeviceInfoSourceConfig::Command {
+                command,
+                args,
+                timeout_secs,
+            }
+                if command == "/usr/bin/link-device-info"
+                    && args.as_deref() == Some(&["--json".to_string()])
+                    && timeout_secs == &Some(7)
+        ));
+        let crate::device::DeviceInfoSourceProvider::Command(provider) =
+            config.device_info_provider().unwrap()
+        else {
+            panic!("expected command device info provider");
+        };
+        assert_eq!(provider.timeout(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn command_device_info_source_requires_command() {
+        let toml = r#"
+host = "https://fleet.fabric.density.ai/"
+
+[auth]
+type = "shared_secret"
+key = "my-key"
+secret = "super-secret"
+
+[device_info]
+source = "command"
+command = ""
+"#;
+        let err = Config::from_toml(toml).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Missing("device_info.command")));
     }
 
     #[test]

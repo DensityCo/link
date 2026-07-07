@@ -4,7 +4,11 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 async fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let client = LinkClient::new(config)?;
+    let device_info_provider = config.device_info_provider();
+    let client = match device_info_provider {
+        Some(provider) => LinkClient::from_provider(config, provider)?,
+        None => LinkClient::new(config)?,
+    };
     let runner = LinkRunner::new(client);
     let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(32);
 

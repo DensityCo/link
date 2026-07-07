@@ -2,7 +2,7 @@
 
 A Rust library and daemon for Fabric Fleet's device deployment protocol. It connects over WebSocket/Phoenix Channels, receives deployment requests, downloads firmware, and applies it through a configurable installer. The default daemon installer uses `fwup`.
 
-The library is intentionally platform agnostic. It does not read Nerves KV, call `Nerves.Runtime`, or know how a device stores its identity. Callers provide serial number, firmware metadata, and runtime state through config, direct `DeviceInfo`, or the `DeviceInfoProvider` trait.
+The library is intentionally platform agnostic. It does not read Nerves KV, call `Nerves.Runtime`, or know how a device stores its identity. Callers provide serial number, firmware metadata, and runtime state through config, direct `DeviceInfo`, or the `DeviceInfoProvider` trait. Providers are refreshed before each connection attempt so devices can report the firmware metadata that is actually active after a reboot.
 
 ## Building
 
@@ -47,7 +47,7 @@ Configuration is a TOML file. See `examples/` for complete samples.
 
 \* The daemon constructor needs `serial_number` when it builds device metadata from config. Library callers can omit it and provide identity plus device settings through `LinkClient::with_device_info` or `LinkClient::from_provider`.
 
-### Firmware metadata
+### Firmware Metadata
 
 For the config-backed daemon path, the `[firmware]` section describes the currently running firmware:
 
@@ -60,7 +60,57 @@ architecture = "arm"
 product = "my-product"
 ```
 
-All fields in this section are required when the daemon builds `DeviceInfo` from config. Library callers using `LinkClient::with_device_info` or `LinkClient::from_provider` can omit this section and supply firmware metadata directly.
+All fields in this section are required when the daemon builds `DeviceInfo` from static config.
+
+For production daemon deployments, prefer a runtime device info source instead of static firmware metadata. Runtime sources are refreshed before each connection attempt, so after a firmware update and reboot the next join reports the active firmware metadata. If the source is missing, fails, returns invalid JSON, or omits required metadata, the daemon logs the error and exits instead of reconnecting forever with bad identity.
+
+Read `DeviceInfo` JSON from a file:
+
+```toml
+[device_info]
+source = "json_file"
+path = "/run/link/device-info.json"
+```
+
+Or read `DeviceInfo` JSON from a command's stdout:
+
+```toml
+[device_info]
+source = "command"
+command = "/usr/bin/link-device-info"
+args = []
+timeout_secs = 5
+```
+
+Command sources default to a five-second timeout. If the command times out, exits non-zero, returns invalid JSON, or omits required metadata, the daemon logs the error and exits.
+
+The file content or command output must be JSON in this shape:
+
+```json
+{
+  "serial_number": "device-001",
+  "firmware": {
+    "uuid": "aaaa-bbbb-cccc",
+    "version": "1.0.0",
+    "platform": "rpi4",
+    "architecture": "arm",
+    "product": "my-product"
+  },
+  "device_api_version": "2.3.0",
+  "fwup_version": "1.12.0",
+  "console_version": "2.0.0",
+  "runtime_state": {
+    "currently_downloading_uuid": null,
+    "firmware_validated": true,
+    "firmware_auto_revert_detected": false
+  },
+  "extra_join_params": {}
+}
+```
+
+`fwup_version`, `console_version`, `runtime_state`, and `extra_join_params` may be omitted. The daemon remains platform agnostic: on Nerves, the configured command can read `Nerves.Runtime.KV.get_all_active()`; on other systems it can read a bootloader environment, RAUC/Mender/SWUpdate state, `/etc/os-release`, or a product-owned version file.
+
+Library callers using `LinkClient::with_device_info` or `LinkClient::from_provider` can omit both `[firmware]` and `[device_info]` and supply firmware metadata directly.
 
 ### Authentication
 
@@ -150,13 +200,49 @@ The device presents its client certificate during the TLS handshake. The server 
 
 ### Device identity
 
-The serial number identifies the device to the server. For config-backed daemon usage, set it directly:
+The serial number identifies the device to the server. For static config-backed daemon usage, set it directly:
 
 ```toml
 serial_number = "device-001"
 ```
 
-Applications embedding the library can omit `serial_number` from config and pass the serial number, firmware metadata, and runtime state through `LinkClient::with_device_info` or `LinkClient::from_provider`. If those values change while the process is running, update them with `LinkClient::set_device_info` before the next connection attempt.
+Applications embedding the library, and daemon users configuring `[device_info]`, can omit `serial_number` from static config. Static callers can update those values with `LinkClient::set_device_info` before the next connection attempt.
+
+For production devices, prefer a `DeviceInfoProvider` that reads the platform's active runtime metadata. The provider can live in a module owned by the application:
+
+```rust
+use link::{DeviceInfo, DeviceInfoProvider, LinkClient};
+
+mod runtime_identity {
+    use super::*;
+
+    pub struct Provider;
+
+    impl DeviceInfoProvider for Provider {
+        type Error = std::io::Error;
+
+        fn device_info(&self) -> Result<DeviceInfo, Self::Error> {
+            read_device_info_from_platform()
+        }
+    }
+
+    fn read_device_info_from_platform() -> Result<DeviceInfo, std::io::Error> {
+        // Read the active firmware metadata from the target platform:
+        // Nerves KV, a bootloader env, RAUC/Mender/SWUpdate state, a version file, etc.
+        todo!()
+    }
+}
+
+let client = LinkClient::from_provider(config, runtime_identity::Provider)?;
+```
+
+You can also pass a function or closure directly:
+
+```rust
+let client = LinkClient::from_provider(config, || read_device_info_from_platform())?;
+```
+
+`LinkClient::run` refreshes the provider before joining the server. `LinkRunner` calls `run` for every reconnect, so reconnects also pick up new active firmware metadata. `LinkClient::current_device_info` and `LinkClient::current_join_payload` read the provider on each call. `serial()` and `join_payload()` return the cached values; call `LinkClient::refresh_device_info` when you want to update that cache from the provider without starting a connection.
 
 ### Firmware installer
 
@@ -213,7 +299,7 @@ The client also manages these internal alarms:
 On startup, `link`:
 
 1. Reads the config file
-2. Builds device metadata from static config
+2. Builds device metadata from static config or the configured runtime `[device_info]` source
 3. Connects to the server via WebSocket
 4. Joins the device channel with caller-provided firmware metadata
 5. Joins the extensions channel when requested and reports health if the server selects the `health` extension

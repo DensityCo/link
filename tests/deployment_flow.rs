@@ -609,6 +609,7 @@ impl TestFixture {
                 key: "test-key".to_string(),
                 secret: "test-secret".to_string(),
             },
+            device_info: None,
             serial_number: Some("integration-device-001".to_string()),
             fwup_devpath: None,
             fwup_task: None,

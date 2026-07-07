@@ -3,7 +3,7 @@ use crate::config::{Config, ConfigError};
 use crate::connection::{ConnectionLoop, ConnectionParts};
 use crate::console::{ConsoleBackend, ConsoleError, PtyConsoleBackend};
 use crate::deployment::{self, Deployment, DeploymentManager};
-use crate::device::{DeviceInfo, DeviceInfoError, DeviceInfoProvider};
+use crate::device::{DeviceInfo, DeviceInfoError, DeviceInfoProvider, DynDeviceInfoProvider};
 use crate::extensions::{HealthReporter, SystemHealthReporter};
 use crate::identify::{IdentifyAction, IdentifyController, IdentifyError};
 use crate::reboot::{RebootController, RebootError, Rebooter};
@@ -63,6 +63,17 @@ pub enum ClientEvent {
     Disconnected(String),
 }
 
+impl ClientError {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ClientError::Config(_)
+                | ClientError::DeviceInfo(_)
+                | ClientError::DeviceInfoProvider(_)
+        )
+    }
+}
+
 /// A device protocol client with platform-agnostic device metadata.
 pub struct LinkClient {
     config: Config,
@@ -74,6 +85,7 @@ pub struct LinkClient {
     identify_controller: IdentifyController,
     script_controller: ScriptController,
     alarm_store: AlarmStore,
+    device_info_provider: Option<Arc<dyn DynDeviceInfoProvider>>,
 }
 
 impl LinkClient {
@@ -87,13 +99,10 @@ impl LinkClient {
     }
 
     pub fn with_device_info(config: Config, device_info: DeviceInfo) -> Result<Self, ClientError> {
-        device_info.validate()?;
         let deployment_manager = DeploymentManager::from_config(&config);
         let reboot_controller = RebootController::from_config(config.reboot.as_ref());
         let identify_controller = IdentifyController::from_config(config.identify.as_ref());
         let script_controller = ScriptController::from_config(config.scripts.as_ref());
-        let alarm_store = AlarmStore::default();
-        sync_runtime_alarms(&alarm_store, &device_info);
         let console_backend = config
             .console
             .as_ref()
@@ -101,6 +110,10 @@ impl LinkClient {
             .map(|console| {
                 Arc::new(PtyConsoleBackend::from_config(console)) as Arc<dyn ConsoleBackend>
             });
+        let device_info = with_console_version(device_info, console_backend.is_some());
+        device_info.validate()?;
+        let alarm_store = AlarmStore::default();
+        sync_runtime_alarms(&alarm_store, &device_info);
         Ok(Self {
             config,
             device_info,
@@ -111,20 +124,81 @@ impl LinkClient {
             identify_controller,
             script_controller,
             alarm_store,
+            device_info_provider: None,
         })
     }
 
     pub fn from_provider<P>(config: Config, provider: P) -> Result<Self, ClientError>
     where
-        P: DeviceInfoProvider,
+        P: DeviceInfoProvider + 'static,
     {
-        let device_info = provider
-            .device_info()
-            .map_err(|e| ClientError::DeviceInfoProvider(e.to_string()))?;
-        Self::with_device_info(config, device_info)
+        let provider: Arc<dyn DynDeviceInfoProvider> = Arc::new(provider);
+        let device_info = load_provider_device_info(&provider)?;
+        let mut client = Self::with_device_info(config, device_info)?;
+        client.device_info_provider = Some(provider);
+        Ok(client)
     }
 
     pub fn set_device_info(&mut self, device_info: DeviceInfo) -> Result<(), ClientError> {
+        let device_info = with_console_version(device_info, self.console_backend.is_some());
+        device_info.validate()?;
+        sync_runtime_alarms(&self.alarm_store, &device_info);
+        self.device_info = device_info;
+        self.device_info_provider = None;
+        Ok(())
+    }
+
+    pub fn set_device_info_provider<P>(&mut self, provider: P) -> Result<(), ClientError>
+    where
+        P: DeviceInfoProvider + 'static,
+    {
+        let provider: Arc<dyn DynDeviceInfoProvider> = Arc::new(provider);
+        let device_info = with_console_version(
+            load_provider_device_info(&provider)?,
+            self.console_backend.is_some(),
+        );
+        device_info.validate()?;
+        sync_runtime_alarms(&self.alarm_store, &device_info);
+        self.device_info = device_info;
+        self.device_info_provider = Some(provider);
+        Ok(())
+    }
+
+    pub fn with_device_info_provider<P>(mut self, provider: P) -> Result<Self, ClientError>
+    where
+        P: DeviceInfoProvider + 'static,
+    {
+        self.set_device_info_provider(provider)?;
+        Ok(self)
+    }
+
+    pub fn current_device_info(&self) -> Result<DeviceInfo, ClientError> {
+        let device_info = match &self.device_info_provider {
+            Some(provider) => load_provider_device_info(provider)?,
+            None => self.device_info.clone(),
+        };
+        let device_info = with_console_version(device_info, self.console_backend.is_some());
+        device_info.validate()?;
+        sync_runtime_alarms(&self.alarm_store, &device_info);
+        Ok(device_info)
+    }
+
+    pub fn current_join_payload(&self) -> Result<serde_json::Value, ClientError> {
+        Ok(self.current_device_info()?.join_payload())
+    }
+
+    pub fn disable_device_info_provider(&mut self) {
+        self.device_info_provider = None;
+    }
+
+    pub fn refresh_device_info(&mut self) -> Result<(), ClientError> {
+        let Some(provider) = &self.device_info_provider else {
+            return Ok(());
+        };
+        let device_info = with_console_version(
+            load_provider_device_info(provider)?,
+            self.console_backend.is_some(),
+        );
         device_info.validate()?;
         sync_runtime_alarms(&self.alarm_store, &device_info);
         self.device_info = device_info;
@@ -242,10 +316,12 @@ impl LinkClient {
     /// Connect to the server and run the event loop.
     /// Sends events through the returned channel.
     pub async fn run(&self, event_tx: mpsc::Sender<ClientEvent>) -> Result<(), ClientError> {
+        let device_info = self.current_device_info()?;
+
         ConnectionLoop::new(ConnectionParts {
             config: self.config.clone(),
-            serial: self.serial().to_string(),
-            join_payload: self.join_payload(),
+            serial: device_info.serial_number.clone(),
+            join_payload: device_info.join_payload(),
             deployment_manager: self.deployment_manager.clone(),
             health_reporter: Arc::clone(&self.health_reporter),
             console_backend: self.console_backend.clone(),
@@ -257,6 +333,24 @@ impl LinkClient {
         .run(event_tx)
         .await
     }
+}
+
+fn load_provider_device_info(
+    provider: &Arc<dyn DynDeviceInfoProvider>,
+) -> Result<DeviceInfo, ClientError> {
+    let device_info = provider
+        .device_info()
+        .map_err(|e| ClientError::DeviceInfoProvider(e.to_string()))?;
+    device_info.validate()?;
+    Ok(device_info)
+}
+
+fn with_console_version(mut device_info: DeviceInfo, console_enabled: bool) -> DeviceInfo {
+    if console_enabled && device_info.console_version.is_none() {
+        device_info.console_version = Some("2.0.0".to_string());
+    }
+
+    device_info
 }
 
 fn sync_runtime_alarms(alarm_store: &AlarmStore, device_info: &DeviceInfo) {
@@ -279,6 +373,8 @@ mod tests {
         DeviceInfo, DeviceRuntimeState, FirmwareMetadata, StaticDeviceInfoProvider,
     };
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn test_config() -> Config {
         Config {
@@ -287,6 +383,7 @@ mod tests {
                 key: "test-key".to_string(),
                 secret: "test-secret".to_string(),
             },
+            device_info: None,
             serial_number: Some("test-device-001".to_string()),
             fwup_devpath: None,
             fwup_task: None,
@@ -311,6 +408,24 @@ mod tests {
             reboot: None,
             identify: None,
             scripts: None,
+        }
+    }
+
+    fn provider_info(version: impl Into<String>) -> DeviceInfo {
+        DeviceInfo {
+            serial_number: "provider-device-001".to_string(),
+            firmware: FirmwareMetadata {
+                uuid: "provider-fw".to_string(),
+                version: version.into(),
+                platform: "x86_64".to_string(),
+                architecture: "x86_64".to_string(),
+                product: "provider-product".to_string(),
+            },
+            device_api_version: "2.3.0".to_string(),
+            fwup_version: Some("1.13.0".to_string()),
+            console_version: None,
+            runtime_state: DeviceRuntimeState::default(),
+            extra_join_params: BTreeMap::new(),
         }
     }
 
@@ -390,6 +505,82 @@ mod tests {
         assert_eq!(client.serial(), "provider-device-001");
         assert_eq!(payload["fwup_version"], "1.12.0");
         assert_eq!(payload["meta"]["firmware_validated"], true);
+    }
+
+    #[test]
+    fn current_device_info_refreshes_provider_each_time() {
+        let mut config = test_config();
+        config.serial_number = None;
+        config.firmware = None;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = {
+            let calls = Arc::clone(&calls);
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok::<_, DeviceInfoError>(provider_info(format!("2.0.{call}")))
+            }
+        };
+
+        let client = LinkClient::from_provider(config, provider).unwrap();
+
+        assert_eq!(client.join_payload()["nerves_fw_version"], "2.0.1");
+        assert_eq!(
+            client.current_device_info().unwrap().firmware.version,
+            "2.0.2"
+        );
+        assert_eq!(
+            client.current_join_payload().unwrap()["nerves_fw_version"],
+            "2.0.3"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn refresh_device_info_updates_cached_payload_from_provider() {
+        let mut config = test_config();
+        config.serial_number = None;
+        config.firmware = None;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = {
+            let calls = Arc::clone(&calls);
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok::<_, DeviceInfoError>(provider_info(format!("3.0.{call}")))
+            }
+        };
+
+        let mut client = LinkClient::from_provider(config, provider).unwrap();
+        client.refresh_device_info().unwrap();
+
+        assert_eq!(client.join_payload()["nerves_fw_version"], "3.0.2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn set_device_info_replaces_provider_with_static_info() {
+        let mut config = test_config();
+        config.serial_number = None;
+        config.firmware = None;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, DeviceInfoError>(provider_info("4.0.0"))
+            }
+        };
+
+        let mut client = LinkClient::from_provider(config, provider).unwrap();
+        client.set_device_info(provider_info("manual")).unwrap();
+
+        assert_eq!(
+            client.current_device_info().unwrap().firmware.version,
+            "manual"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
