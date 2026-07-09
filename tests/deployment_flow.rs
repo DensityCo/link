@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
 const FIRMWARE_BODY: &[u8] = b"test firmware bytes";
+const FIRMWARE_BODY_SHA256: &str =
+    "70BE8195CC9291CCBE96A5866B53ECBAA70253A929A2D2E2C592D43B88CE7B80";
 const TEST_UUID: &str = "integration-fw-uuid";
 
 #[derive(Debug, Clone)]
@@ -989,14 +991,23 @@ async fn run_update_server(listener: TcpListener, firmware_url: String) -> Vec<W
         "device",
         "update",
         {
+            "update_available": true,
             "firmware_url": firmware_url,
             "firmware_meta": {
                 "uuid": TEST_UUID,
                 "version": "2.0.0",
                 "platform": "x86_64",
                 "architecture": "x86_64",
-                "product": "integration-test"
-            }
+                "product": "integration-test",
+                "author": "integration",
+                "description": "test release",
+                "vcs_identifier": "abcdef",
+                "misc": "test metadata"
+            },
+            "size": FIRMWARE_BODY.len(),
+            "checksum": FIRMWARE_BODY_SHA256,
+            "partials_checksums": [FIRMWARE_BODY_SHA256],
+            "deployment_id": 42
         }
     ]);
     ws.send(tungstenite::Message::Text(update.to_string()))

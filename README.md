@@ -246,6 +246,33 @@ let client = LinkClient::from_provider(config, || read_device_info_from_platform
 
 ### Firmware installer
 
+`link` accepts the update payload shape emitted by NervesHub Web / Fabric Fleet:
+
+```json
+{
+  "update_available": true,
+  "firmware_url": "https://example.com/firmware.fw",
+  "firmware_meta": {
+    "uuid": "aaaa-bbbb-cccc",
+    "version": "1.0.0",
+    "platform": "rpi4",
+    "architecture": "arm",
+    "product": "my-product",
+    "author": null,
+    "description": null,
+    "fwup_version": null,
+    "vcs_identifier": null,
+    "misc": null
+  },
+  "size": 123456,
+  "checksum": "SHA256_HEX",
+  "partials_checksums": [],
+  "deployment_id": 42
+}
+```
+
+`size`, `checksum`, `partials_checksums`, `deployment_id`, and the optional firmware metadata fields may be omitted. Unknown top-level and `firmware_meta` fields are preserved on `Deployment` / `FirmwareMeta` so custom installers can consume server-specific metadata. When `size` or `checksum` is present, `link` validates the completed download before invoking the installer. The checksum format is the uppercase SHA-256 hex string produced by NervesHub Web.
+
 The default daemon path builds a `FwupInstaller` from `fwup_devpath`, `fwup_task`, and `fwup_public_keys`. Configure at least one `fwup_public_keys` entry to have `fwup` verify firmware signatures before applying updates:
 
 ```toml
@@ -260,6 +287,8 @@ Library callers can provide their own installer by constructing a `DeploymentMan
 let deployment_manager = DeploymentManager::with_installer(options, installer);
 client.set_deployment_manager(deployment_manager);
 ```
+
+The downloaded artifact is otherwise opaque. `link` names it `firmware-{uuid}` plus the suffix from `firmware_url`, so current `.fw` URLs stay `.fw`, while bare-Linux bundles such as `.tar.gz` or `.tar.zst` keep their suffix for the custom installer.
 
 ### Health reports
 
@@ -309,7 +338,7 @@ On startup, `link`:
 9. Runs support scripts when `[scripts].enabled = true` and the server sends `scripts/run`
 10. Includes current alarms in health reports
 11. Listens for wire-level `update` events containing a firmware URL
-12. Downloads the firmware to `data_dir` as `firmware-{uuid}.fw.tmp`, then renames it to `firmware-{uuid}.fw`
+12. Downloads the firmware to `data_dir` as `firmware-{uuid}<artifact-suffix>.tmp`, validates size/checksum when supplied, then renames it to `firmware-{uuid}<artifact-suffix>`
 13. Applies it through the configured installer
 14. Reports staged progress and completion to the server
 15. Sends `rebooting` and executes the configured reboot hook when reboot is enabled

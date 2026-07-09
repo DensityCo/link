@@ -52,7 +52,7 @@ pub enum ClientEvent {
     ConsoleStarted,
     ConsoleStopped,
     HealthReported,
-    DeploymentAvailable(Deployment),
+    DeploymentAvailable(Box<Deployment>),
     FirmwareDownloaded(std::path::PathBuf),
     FirmwareApplied,
     RebootRequested,

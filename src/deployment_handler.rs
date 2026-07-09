@@ -51,7 +51,9 @@ impl DeploymentHandler {
 
         let _ = self
             .event_tx
-            .send(ClientEvent::DeploymentAvailable(deployment.clone()))
+            .send(ClientEvent::DeploymentAvailable(Box::new(
+                deployment.clone(),
+            )))
             .await;
         let deployment_manager = self.manager.clone();
         let deployment_alarm_store = self.alarm_store.clone();
